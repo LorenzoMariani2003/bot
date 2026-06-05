@@ -792,110 +792,64 @@ DEFAULT_SYMBOLS = [
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Ottimizzatore parametri per il bot di trading crypto",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Esempi:
-  python optimizer.py --random 500 --days 730
-  python optimizer.py --random 200 --days 365 --interval 4h --symbols BTCUSDC,ETHUSDC
-  python optimizer.py --grid   --days 365 --interval 1d --jobs 2
-  python optimizer.py --random 1000 --min-trades 20 --top 20
-        """)
-
-    # Modalità ricerca
+    parser = argparse.ArgumentParser(description="Crypto Strategy Optimizer v1.0")
     mode_grp = parser.add_mutually_exclusive_group(required=True)
-    mode_grp.add_argument("--random", type=int, metavar="N",
-                          help="Ricerca casuale: N combinazioni da campionare")
-    mode_grp.add_argument("--grid",   action="store_true",
-                          help="Grid search: tutte le combinazioni (può essere lento!)")
-
-    # Configurazione
-    parser.add_argument("--symbols",   default=",".join(DEFAULT_SYMBOLS),
-                        help=f"Simboli separati da virgola (default: tutti)")
-    parser.add_argument("--interval",  default="1d",
-                        help="Intervallo candele: 15m,1h,4h,1d (default: 1d)")
-    parser.add_argument("--days",      type=int,   default=730,
-                        help="Giorni di storico da scaricare (default: 730)")
-    parser.add_argument("--capital",   type=float, default=100.0,
-                        help="Capitale iniziale per il backtest (default: 100)")
-    parser.add_argument("--min-trades",type=int,   default=10,
-                        help="Numero minimo di trade per considerare la config (default: 10)")
-    parser.add_argument("--jobs",      type=int,
-                        default=max(1, cpu_count() - 1),
-                        help=f"Job paralleli (default: {max(1,cpu_count()-1)}, "
-                             f"Raspberry Pi: usa 1 o 2)")
-    parser.add_argument("--top",       type=int,   default=10,
-                        help="Numero di configurazioni top da mostrare (default: 10)")
-    parser.add_argument("--out",       default="optimizer_results.csv",
-                        help="File CSV di output (default: optimizer_results.csv)")
-    parser.add_argument("--seed",      type=int,   default=42,
-                        help="Seed casuale per riproducibilità (default: 42)")
-    parser.add_argument("--force-download", action="store_true",
-                        help="Forza ri-download dei dati (ignora cache)")
-
+    mode_grp.add_argument("--random", type=int, metavar="N", help="Ricerca casuale: N combinazioni")
+    mode_grp.add_argument("--grid", action="store_true", help="Grid search")
+    parser.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS), help="Simboli separati da virgola")
+    parser.add_argument("--interval", default="all", help="Intervallo: 15m, 1h, 4h, 1d o 'all' (default: all)")
+    parser.add_argument("--days", type=int, default=730, help="Giorni di storico")
+    parser.add_argument("--capital", type=float, default=100.0, help="Capitale iniziale")
+    parser.add_argument("--min-trades", type=int, default=10, help="Numero minimo di trade")
+    parser.add_argument("--jobs", type=int, default=max(1, cpu_count() - 1), help="Job paralleli")
+    parser.add_argument("--top", type=int, default=10, help="Numero di configurazioni top")
+    parser.add_argument("--out", default="optimizer_results.csv", help="File CSV di output")
+    parser.add_argument("--seed", type=int, default=42, help="Seed casuale")
     args = parser.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
-
     symbols = [s.strip().upper() for s in args.symbols.split(",")]
+    
+    intervals_to_test = ["15m", "1h", "4h", "1d"] if args.interval == "all" else [args.interval]
+    all_global_results = []
 
-    print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║            CRYPTO STRATEGY OPTIMIZER v1.0                   ║
-╠══════════════════════════════════════════════════════════════╣
-║  Simboli   : {', '.join(symbols):<43} ║
-║  Intervallo: {args.interval:<47} ║
-║  Periodo   : {args.days} giorni{'':<39} ║
-║  Capitale  : {args.capital:.0f} USDC{'':<42} ║
-║  Min trade : {args.min_trades:<47} ║
-║  Jobs      : {args.jobs:<47} ║
-╚══════════════════════════════════════════════════════════════╝""")
+    for current_interval in intervals_to_test:
+        print(f"\n{'='*60}\n  TESTING INTERVAL: {current_interval}\n{'='*60}")
+        opt = Optimizer(
+            symbols=symbols, interval=current_interval, days=args.days,
+            initial_capital=args.capital, min_trades=args.min_trades,
+            n_jobs=args.jobs, top_n=args.top, output_csv=args.out
+        )
+        opt.load_data()
+        if not opt.data_map:
+            continue
 
-    opt = Optimizer(
-        symbols         = symbols,
-        interval        = args.interval,
-        days            = args.days,
-        initial_capital = args.capital,
-        min_trades      = args.min_trades,
-        n_jobs          = args.jobs,
-        top_n           = args.top,
-        output_csv      = args.out,
-    )
+        base = ParamSet()
+        if args.random:
+            param_list = [random_param_set(base) for _ in range(args.random)]
+            param_list.append(base)
+        else:
+            param_list = grid_param_sets(base)
 
-    # 1. Scarica dati
-    opt.load_data()
-    if not opt.data_map:
-        print("  ERRORE: nessun dato scaricato. Controlla la connessione o i simboli.")
-        sys.exit(1)
+        results = opt.run(param_list)
+        for r in results:
+            r["INTERVAL"] = current_interval
+        all_global_results.extend(results)
 
-    # 2. Genera lista di ParamSet
-    base = ParamSet()
-    if args.random:
-        n = args.random
-        print(f"\n  Generazione {n} combinazioni casuali (seed={args.seed})...")
-        param_list = [random_param_set(base) for _ in range(n)]
-        # Aggiungi sempre il ParamSet di default come punto di riferimento
-        param_list.append(base)
-    else:
-        print(f"\n  Generazione grid search (spazio completo)...")
-        param_list = grid_param_sets(base)
-        grid_size  = len(param_list)
-        print(f"  Grid size: {grid_size} combinazioni")
-        if grid_size > 10_000:
-            print(f"  ⚠️  Grid molto grande! Usa --random per la ricerca casuale.")
-            confirm = input("  Procedere? [s/N]: ")
-            if confirm.lower() != "s":
-                sys.exit(0)
-
-    # 3. Esegui ottimizzazione
-    results = opt.run(param_list)
-
-    # 4. Salva e stampa risultati
-    opt.save_results(results)
-    opt.print_leaderboard(results)
-
+    all_global_results.sort(key=lambda x: x["_composite"], reverse=True)
+    
+    if all_global_results:
+        opt.save_results(all_global_results)
+        opt.print_leaderboard(all_global_results)
+        
+        best = all_global_results[0]
+        best_clean = {k: v for k, v in best.items() if not k.startswith("_")}
+        best_clean["INTERVAL"] = best["INTERVAL"]
+        
+        with open("best_config.json", "w") as f:
+            json.dump(best_clean, f, indent=2)
+        print(f"\n  💾 Global best config salvata in: best_config.json (Interval: {best['INTERVAL']})")
 
 if __name__ == "__main__":
     main()
