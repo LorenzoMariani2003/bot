@@ -9,3 +9,4 @@ __pycache__/
 *.parquet
 .venv/
 venv/
+*:Zone.Identifier
