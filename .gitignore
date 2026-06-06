@@ -1,7 +1,14 @@
+# Credentials and keys
 secrets.json
+
+# Optimized configs and states
 best_config.json
 status_v2.json
 state_v2.json
+state_livetest.json
+vp_livetest.json
+
+# Logs and data
 *.log
 *.csv
 .ohlcv_cache/
@@ -9,4 +16,6 @@ __pycache__/
 *.parquet
 .venv/
 venv/
+
+# Ignore Windows/WSL Zone Identifier metadata files
 *:Zone.Identifier
