@@ -1,1314 +1,1131 @@
 """
-╔═════════════════════════════════════════════════════════════════════════════╗
-║              CRYPTO TRADING BOT v2.0 — QUANT ARCHITECTURE                   ║
-║                                                                             ║
-║  Modules (in-file classes):                                                 ║
-║    Config          → parametri globali e costanti                           ║
-║    Logger          → logging su file + console con rotazione                ║
-║    IndicatorEngine → calcolo vettoriale indicatori (EMA, ADX, RSI, ATR, BB) ║
-║    Strategy        → logica multi-segnale con scoring pesato                ║
-║    RiskManager     → Kelly frazionato, trailing stop ATR, daily drawdown    ║
-║    BinanceClient   → wrapper async con retry esponenziale + jitter          ║
-║    DataFeed        → WebSocket stream (ticker + depth) via asyncio          ║
-║    PositionManager → stato posizioni, P&L, log CSV                          ║
-║    TelegramHandler → comandi bot Telegram in thread separato                ║
-║    TradingBot      → orchestratore principale (event loop asyncio)          ║
-║                                                                             ║
-║  DISCLAIMER: Solo scopo educativo. Il trading crypto è ad alto rischio.     ║
-╚═════════════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          CRYPTO STRATEGY OPTIMIZER v1.1 — MULTI-WINDOW VALIDATION          ║
+║                                                                              ║
+║  Modalità di ricerca:                                                        ║
+║    --random N    → campiona N combinazioni casuali (default: 300)            ║
+║    --grid        → enumera tutte le combo (attenzione: può essere lento)     ║
+║                                                                              ║
+║  Validazione multi-finestra temporale:                                       ║
+║    --windows K   → K finestre casuali dallo storico (default: 5)            ║
+║    --win-min D   → durata minima finestra in giorni (default: 90)            ║
+║    --win-max D   → durata massima finestra in giorni (default: days//2)     ║
+║                                                                              ║
+║    Le finestre sono generate UNA SOLA VOLTA e condivise da tutte le         ║
+║    combinazioni, così ogni param-set è valutato su periodi di mercato        ║
+║    diversi (trend, laterale, crash, rally) e non solo sugli ultimi N gg.    ║
+║                                                                              ║
+║  Metriche di ranking (punteggio composito):                                  ║
+║    Sharpe ratio  40% · Total return  30% · Win rate  20% · PF  10%          ║
+║    × consistency_factor (% finestre profittevoli) × stability_factor         ║
+║                                                                              ║
+║  Uso:                                                                        ║
+║    python optimizer.py --random 500 --days 730 --windows 6                  ║
+║    python optimizer.py --random 300 --days 1095 --windows 8 --win-min 60    ║
+║    python optimizer.py --grid   --days 365  --interval 4h --windows 4       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 # ─── IMPORTS ──────────────────────────────────────────────────────────────────
-import asyncio
+import argparse
+import csv
+import itertools
 import json
-import logging
 import math
 import os
 import random
 import sys
 import time
-import csv
-import threading
-import argparse
-from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
-from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional, Tuple
+import warnings
+from dataclasses import dataclass, asdict, fields
+from datetime import datetime, timedelta
+from multiprocessing import Pool, cpu_count
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 
-try:
-    from binance import AsyncClient, BinanceSocketManager
-    from binance.client import Client
-    from binance.exceptions import BinanceAPIException, BinanceRequestException
-    _HAS_BINANCE = True
-except ImportError:
-    _HAS_BINANCE = False
-    print("WARN: python-binance non installato. Avvia: pip install python-binance")
-
+warnings.filterwarnings("ignore")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  1. CONFIG
+#  PARAMETRI E SPAZIO DI RICERCA
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class Config:
-    API_KEY: str = ""
-    API_SECRET: str = ""
-    TELEGRAM_TOKEN: str = ""
-    TELEGRAM_CHAT_ID: str = ""
-    SYMBOLS: List[str] = field(default_factory=lambda: ["BTCUSDC", "ETHUSDC", "BNBUSDC", "SOLUSDC", "ADAUSDC", "XRPUSDC", "DOGEUSDC", "AVAXUSDC"])
-    QUOTE_ASSET: str = "USDC"
-    INTERVAL: str = "1h"
-    CANDLE_LIMIT: int = 300
-    MAX_OPEN_POSITIONS: int = 5
-    KELLY_FRACTION: float = 0.25
-    MIN_KELLY_BET: float = 0.02
-    MAX_KELLY_BET: float = 0.20
-    MIN_USDC_TRADE: float = 11.0
-    DAILY_DRAWDOWN_LIMIT: float = 0.05
-    ATR_PERIOD: int = 14
-    ATR_STOP_MULT: float = 2.0
-    ATR_TP_MULT: float = 3.0
-    EMA_FAST: int = 16
-    EMA_SLOW: int = 21
-    EMA_TREND: int = 200
-    ADX_PERIOD: int = 10
-    ADX_MIN: float = 22.0
-    RSI_PERIOD: int = 14
-    RSI_OB: float = 70.0
-    RSI_OS: float = 30.0
-    BB_PERIOD: int = 20
-    BB_STD: float = 2.0
-    SIGNAL_THRESHOLD: float = 60.0
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {
-        "ema_trend": 25.0, "ema_cross": 20.0, "adx_strength": 15.0,
-        "rsi_ok": 15.0, "bb_position": 10.0, "volume_spike": 10.0, "ob_imbalance": 5.0
-    })
-    OB_DEPTH_LEVELS: int = 10
-    OB_IMBALANCE_TH: float = 0.55
-    MAX_SLIPPAGE_PCT: float = 0.003
-    LOOP_SLEEP_SEC: int = 60
-    WS_RECONNECT_SEC: int = 5
-    LOG_FILE: str = "bot_v2.log"
-    TRADE_LOG: str = "trades_v2.csv"
-    STATE_FILE: str = "state_v2.json"
-    STATUS_FILE: str = "status_v2.json"
-
-    @classmethod
-    def load_configs(cls):
-        cfg = cls()
-        if os.path.exists("secrets.json"):
-            with open("secrets.json") as f:
-                sec = json.load(f)
-                cfg.API_KEY = sec.get("API_KEY", "")
-                cfg.API_SECRET = sec.get("API_SECRET", "")
-                cfg.TELEGRAM_TOKEN = sec.get("TELEGRAM_TOKEN", "")
-                cfg.TELEGRAM_CHAT_ID = sec.get("TELEGRAM_CHAT_ID", "")
-        if os.path.exists("best_config.json"):
-            with open("best_config.json") as f:
-                best = json.load(f)
-                for k, v in best.items():
-                    k_upper = k.upper()
-                    if hasattr(cfg, k_upper):
-                        setattr(cfg, k_upper, v)
-        return cfg
-# ══════════════════════════════════════════════════════════════════════════════
-#  2. LOGGER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_logger(log_file: str, level=logging.INFO) -> logging.Logger:
-    """Logger con rotazione file (max 5 MB × 3 backup). Thread-safe."""
-    logger = logging.getLogger("TradingBot")
-    logger.setLevel(level)
-    if logger.handlers:
-        return logger
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-    # Console
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-    # File con rotazione
-    fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3,
-                             encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    return logger
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  3. INDICATOR ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-
-class IndicatorEngine:
+class ParamSet:
     """
-    Calcolo vettoriale puro con NumPy/Pandas.
-    Tutti i metodi operano su DataFrame e restituiscono colonne aggiuntive.
+    Ogni campo è un iperparametro ottimizzabile.
+    SEARCH_SPACE definisce i valori da esplorare per ogni campo.
     """
+    # ── EMA ──────────────────────────────────────────────────────────────────
+    ema_fast:  int   = 21
+    ema_slow:  int   = 55
+    ema_trend: int   = 200    # 0 = disabilitato (rimuove il filtro di trend)
 
-    @staticmethod
-    def ema(series: pd.Series, period: int) -> pd.Series:
-        return series.ewm(span=period, adjust=False).mean()
+    # ── ADX ──────────────────────────────────────────────────────────────────
+    adx_period: int   = 14
+    adx_min:    float = 22.0  # 0 = disabilitato
 
-    @staticmethod
-    def rsi(series: pd.Series, period: int) -> pd.Series:
-        """RSI classico di Wilder (usa EWM con alpha=1/period)."""
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
-        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+    # ── RSI ──────────────────────────────────────────────────────────────────
+    rsi_period: int   = 14
+    rsi_ob:     float = 70.0  # overbought: NON comprare sopra questo valore
+    rsi_os:     float = 30.0  # oversold: bonus se sotto questo valore
 
-    @staticmethod
-    def atr(df: pd.DataFrame, period: int) -> pd.Series:
-        """
-        Average True Range:
-        TR = max(H-L, |H-Cp|, |L-Cp|)  dove Cp = close precedente
-        ATR = EWM(TR, alpha=1/period)
-        """
-        high, low, close = df["high"], df["low"], df["close"]
-        prev_close = close.shift(1)
-        tr = pd.concat([
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ], axis=1).max(axis=1)
-        return tr.ewm(alpha=1 / period, adjust=False).mean()
+    # ── ATR (stop/take profit) ────────────────────────────────────────────────
+    atr_period:    int   = 14
+    atr_stop_mult: float = 2.0   # SL = entry - mult × ATR
+    atr_tp_mult:   float = 3.0   # TP = entry + mult × ATR  (R:R ≈ 1.5)
 
-    @staticmethod
-    def adx(df: pd.DataFrame, period: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """
-        ADX, +DI, -DI secondo il metodo Wilder.
-        ADX misura la FORZA del trend (non la direzione).
-        ADX > 25 → trend forte; ADX < 20 → mercato laterale.
-        """
-        high, low, close = df["high"], df["low"], df["close"]
-        prev_high = high.shift(1)
-        prev_low  = low.shift(1)
+    # ── Bollinger Bands ───────────────────────────────────────────────────────
+    bb_period: int   = 20
+    bb_std:    float = 2.0
 
-        dm_plus  = (high - prev_high).clip(lower=0)
-        dm_minus = (prev_low - low).clip(lower=0)
-        # Annulla quando entrambe positive e la differenza non è dominante
-        mask = dm_plus < dm_minus
-        dm_plus[mask] = 0
-        mask2 = dm_minus < dm_plus
-        dm_minus[mask2] = 0
+    # ── Volume spike ─────────────────────────────────────────────────────────
+    vol_mult: float = 1.5   # spike se volume > vol_mult × SMA_volume(20)
 
-        atr_val = IndicatorEngine.atr(df, period)
-        di_plus  = 100 * dm_plus.ewm(alpha=1/period, adjust=False).mean() / atr_val
-        di_minus = 100 * dm_minus.ewm(alpha=1/period, adjust=False).mean() / atr_val
-        dx = (100 * (di_plus - di_minus).abs() /
-              (di_plus + di_minus).replace(0, np.nan))
-        adx_val = dx.ewm(alpha=1 / period, adjust=False).mean()
-        return adx_val, di_plus, di_minus
+    # ── Score soglia di ingresso ──────────────────────────────────────────────
+    signal_threshold: float = 55.0
 
-    @staticmethod
-    def bollinger_bands(series: pd.Series, period: int,
-                        std_mult: float) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """BB: middle = SMA(period), upper/lower = middle ± std_mult*σ"""
-        middle = series.rolling(period).mean()
-        std    = series.rolling(period).std()
-        return middle + std_mult * std, middle, middle - std_mult * std
+    # ── Position sizing (% del capitale per ogni trade) ───────────────────────
+    position_pct: float = 0.15
 
-    @staticmethod
-    def macd(series: pd.Series, fast=12, slow=26,
-             signal=9) -> Tuple[pd.Series, pd.Series]:
-        ema_f = series.ewm(span=fast, adjust=False).mean()
-        ema_s = series.ewm(span=slow, adjust=False).mean()
-        macd_line   = ema_f - ema_s
-        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-        return macd_line, signal_line
+    # ── Commissioni simulate ─────────────────────────────────────────────────
+    commission: float = 0.001   # 0.1% per lato (Binance BNB holder)
 
-    def populate(self, df: pd.DataFrame, cfg: "Config") -> pd.DataFrame:
-        """Applica tutti gli indicatori al DataFrame e li aggiunge come colonne."""
-        df = df.copy()
-        close = df["close"]
+    # ──────────────────────────────────────────────────────────────────────────
+    # SPAZIO DI RICERCA
+    # ──────────────────────────────────────────────────────────────────────────
+    SEARCH_SPACE: Dict[str, List[Any]] = None
 
-        df["ema_fast"]  = self.ema(close, cfg.EMA_FAST)
-        df["ema_slow"]  = self.ema(close, cfg.EMA_SLOW)
-        df["ema_trend"] = self.ema(close, cfg.EMA_TREND) if cfg.EMA_TREND > 0 else 0
-        df["rsi"]       = self.rsi(close, cfg.RSI_PERIOD)
-        df["atr"]       = self.atr(df, cfg.ATR_PERIOD)
+    def __post_init__(self):
+        if self.SEARCH_SPACE is None:
+            self.SEARCH_SPACE = {
+                "ema_fast":  [8, 12, 13, 21, 34],
+                "ema_slow":  [21, 34, 50, 55, 89],
+                "ema_trend": [0, 50, 100, 150, 200],
 
-        adx_val, di_plus, di_minus = self.adx(df, cfg.ADX_PERIOD)
-        df["adx"]       = adx_val
-        df["di_plus"]   = di_plus
-        df["di_minus"]  = di_minus
+                "adx_period": [10, 14, 20],
+                "adx_min":    [0, 15, 18, 22, 25],
 
-        bb_up, bb_mid, bb_low = self.bollinger_bands(
-            close, cfg.BB_PERIOD, cfg.BB_STD)
-        df["bb_upper"]  = bb_up
-        df["bb_middle"] = bb_mid
-        df["bb_lower"]  = bb_low
+                "rsi_period": [10, 14, 21],
+                "rsi_ob":     [60, 65, 70, 75, 80],
+                "rsi_os":     [20, 25, 30, 35],
 
-        macd_line, signal_line = self.macd(close)
-        df["macd"]        = macd_line
-        df["macd_signal"] = signal_line
+                "atr_period":    [10, 14, 21],
+                "atr_stop_mult": [1.0, 1.5, 2.0, 2.5, 3.0],
+                "atr_tp_mult":   [2.0, 3.0, 4.0, 5.0],
 
-        # Volume spike: True se volume > 1.5× media mobile 20 periodi
-        vol_ma = df["volume"].rolling(20).mean()
-        df["vol_spike"] = df["volume"] > (vol_ma * 1.5)
+                "bb_period": [15, 20, 25],
+                "bb_std":    [1.5, 2.0, 2.5],
 
-        return df
+                "vol_mult": [1.2, 1.5, 2.0, 2.5, 3.0],
+
+                "signal_threshold": [30, 40, 50, 55, 60, 65, 70],
+
+                "position_pct": [0.10, 0.15, 0.20, 0.25],
+
+                "commission": [0.001],
+            }
+
+
+def random_param_set(base: ParamSet) -> ParamSet:
+    """Campiona un ParamSet casuale dallo spazio di ricerca."""
+    space = base.SEARCH_SPACE
+    kwargs = {}
+    for f in fields(base):
+        if f.name == "SEARCH_SPACE":
+            continue
+        if f.name in space:
+            kwargs[f.name] = random.choice(space[f.name])
+        else:
+            kwargs[f.name] = getattr(base, f.name)
+    if kwargs["ema_fast"] >= kwargs["ema_slow"]:
+        kwargs["ema_fast"] = max(4, kwargs["ema_slow"] - 5)
+    if kwargs["atr_tp_mult"] <= kwargs["atr_stop_mult"]:
+        kwargs["atr_tp_mult"] = kwargs["atr_stop_mult"] + 1.0
+    return ParamSet(**kwargs)
+
+
+def grid_param_sets(base: ParamSet) -> List[ParamSet]:
+    """Genera tutte le combinazioni possibili."""
+    space  = base.SEARCH_SPACE
+    keys   = [f.name for f in fields(base) if f.name != "SEARCH_SPACE"
+                                             and f.name in space]
+    values = [space[k] for k in keys]
+    result = []
+    for combo in itertools.product(*values):
+        kwargs = dict(zip(keys, combo))
+        if kwargs.get("ema_fast", 1) >= kwargs.get("ema_slow", 2):
+            continue
+        if kwargs.get("atr_tp_mult", 3) <= kwargs.get("atr_stop_mult", 2):
+            continue
+        result.append(ParamSet(**kwargs))
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  4. STRATEGY
+#  FINESTRE TEMPORALI
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Numero di candele per giorno in base all'intervallo
+CANDLES_PER_DAY: Dict[str, float] = {
+    "1m": 1440, "3m": 480, "5m": 288, "15m": 96, "30m": 48,
+    "1h": 24,   "2h": 12,  "4h": 6,   "6h": 4,   "8h": 3,
+    "12h": 2,   "1d": 1.0, "3d": 1/3, "1w": 1/7,
+}
+
 
 @dataclass
-class SignalResult:
-    score:    float          = 0.0
-    buy:      bool           = False
-    sell:     bool           = False
-    reasons:  List[str]      = field(default_factory=list)
-    atr:      float          = 0.0
-    sl_price: float          = 0.0
-    tp_price: float          = 0.0
-
-
-class Strategy:
+class TimeWindow:
     """
-    Strategia multi-segnale con scoring pesato.
+    Finestra temporale definita come slice (start_offset, end_offset)
+    sull'array di candele del DataFrame.
 
-    LOGICA DI ENTRATA (LONG):
-    ─────────────────────────
-    Ogni condizione contribuisce con un peso al punteggio totale (0-100).
-    Se score ≥ SIGNAL_THRESHOLD → segnale BUY.
-
-    Condizioni valutate:
-      1. EMA Trend  : close > EMA200          (trend long-term rialzista)
-      2. EMA Cross  : EMA_fast > EMA_slow     (trend medium-term rialzista)
-      3. ADX        : ADX > ADX_MIN           (trend abbastanza forte)
-      4. RSI        : RSI < RSI_OB            (non in zona ipercomprato)
-      5. Bollinger  : close < BB_middle       (prezzo nella metà inferiore)
-      6. Volume     : volume spike rilevato   (momentum confermato da volume)
-      7. OB         : bid_vol > ask_vol (OB imbalance > soglia)
-
-    LOGICA DI USCITA (SELL):
-    ──────────────────────────
-      - Trailing Stop Loss raggiunto (aggiornato con ATR)
-      - Take Profit raggiunto
-      - EMA cross ribassista: EMA_fast < EMA_slow (dopo essere stato >)
-      - ADX crolla sotto soglia (trend finito)
+    Identica per tutti i simboli e per tutte le combinazioni di parametri:
+    garantisce un confronto equo tra configurazioni diverse.
     """
+    idx:          int   # numero progressivo (0-based)
+    start_offset: int   # indice di inizio (incluso)
+    end_offset:   int   # indice di fine (escluso)
+    n_candles:    int   # numero di candele nella finestra
 
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.ind = IndicatorEngine()
+    def label(self) -> str:
+        return f"W{self.idx + 1}[{self.start_offset}:{self.end_offset}]"
 
-    def score_buy(self, df: pd.DataFrame,
-                  ob_imbalance: float = 0.5) -> SignalResult:
-        """
-        Calcola il punteggio di acquisto basato sugli indicatori.
-        ob_imbalance = bid_volume / (bid_volume + ask_volume)
-        Valori > OB_IMBALANCE_TH indicano pressione rialzista.
-        """
-        cfg = self.cfg
-        result = SignalResult()
-        if len(df) < cfg.EMA_TREND + 5:
-            result.reasons.append("Dati insufficienti per il calcolo")
-            return result
 
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        score = 0.0
-        w = cfg.WEIGHTS
+def generate_windows(data_map:  Dict[str, pd.DataFrame],
+                     n_windows: int,
+                     min_days:  int,
+                     max_days:  int,
+                     interval:  str,
+                     seed:      int) -> List[TimeWindow]:
+    """
+    Genera N finestre temporali casuali, uguali per tutte le combinazioni.
 
-        if cfg.EMA_TREND == 0:
-            score += w["ema_trend"]
-            result.reasons.append("✓ EMA trend: disabilitato")
-        elif last["close"] > last["ema_trend"]:
-            score += w["ema_trend"]
-            pct = (last["close"] / last["ema_trend"] - 1) * 100
-            result.reasons.append(f"✓ EMA trend: prezzo +{pct:.2f}% sopra EMA{cfg.EMA_TREND}")
+    La dimensione di ciascuna finestra è campionata uniformemente in
+    [min_days, max_days] (convertito in candele secondo l'intervallo).
+    La posizione iniziale è scelta casualmente nello storico disponibile.
+
+    In questo modo ogni configurazione è testata su K periodi di mercato
+    diversi (trend, laterale, crash, rally, ecc.), rendendo il ranking
+    molto più robusto rispetto al solo backtest sull'intero dataset.
+    """
+    cpd = CANDLES_PER_DAY.get(interval, 1.0)
+
+    valid_dfs = [df for df in data_map.values() if not df.empty]
+    if not valid_dfs:
+        raise ValueError("Nessun dato disponibile per generare le finestre.")
+    min_len = min(len(df) for df in valid_dfs)
+
+    min_candles = max(60, int(min_days * cpd))
+    max_candles = min(min_len - 10, int(max_days * cpd))
+
+    if max_candles <= min_candles:
+        print(f"\n  ⚠️  Storico troppo corto per finestre di {min_days}–{max_days}d "
+              f"con intervallo {interval} ({min_len} candele disponibili).")
+        print(f"     Uso l'intero dataset come unica finestra.")
+        return [TimeWindow(idx=0, start_offset=0,
+                           end_offset=min_len, n_candles=min_len)]
+
+    rng     = random.Random(seed)
+    windows: List[TimeWindow] = []
+    attempts = 0
+
+    while len(windows) < n_windows and attempts < n_windows * 30:
+        attempts += 1
+        size      = rng.randint(min_candles, max_candles)
+        max_start = min_len - size
+        if max_start <= 0:
+            continue
+        start = rng.randint(0, max_start)
+        windows.append(TimeWindow(
+            idx          = len(windows),
+            start_offset = start,
+            end_offset   = start + size,
+            n_candles    = size,
+        ))
+
+    if not windows:
+        windows.append(TimeWindow(idx=0, start_offset=0,
+                                  end_offset=min_len, n_candles=min_len))
+    return windows
+
+
+def print_windows(windows: List[TimeWindow],
+                  data_map: Dict[str, pd.DataFrame],
+                  interval: str):
+    """Stampa un riepilogo leggibile delle finestre generate."""
+    cpd = CANDLES_PER_DAY.get(interval, 1.0)
+    ref_df = next(iter(data_map.values()), None)
+
+    print(f"\n  Finestre temporali generate ({len(windows)}):")
+    print(f"  {'─'*60}")
+    for win in windows:
+        candles_info = f"{win.n_candles} candele (~{win.n_candles / cpd:.0f}gg)"
+        if ref_df is not None and win.end_offset <= len(ref_df):
+            t_start = ref_df["open_time"].iloc[win.start_offset].strftime("%Y-%m-%d")
+            t_end   = ref_df["open_time"].iloc[win.end_offset - 1].strftime("%Y-%m-%d")
+            print(f"    W{win.idx + 1:>2}: {t_start} → {t_end}  ({candles_info})")
         else:
-            result.reasons.append(f"✗ EMA trend: prezzo sotto EMA{cfg.EMA_TREND}")
-        # 2. EMA Cross (fast > slow)
-        if last["ema_fast"] > last["ema_slow"]:
-            score += w["ema_cross"]
-            result.reasons.append(f"✓ EMA cross: EMA{cfg.EMA_FAST} > EMA{cfg.EMA_SLOW}")
-        else:
-            result.reasons.append(f"✗ EMA cross: EMA{cfg.EMA_FAST} < EMA{cfg.EMA_SLOW}")
-
-        # 3. ADX (forza del trend)
-        if last["adx"] > cfg.ADX_MIN and last["di_plus"] > last["di_minus"]:
-            score += w["adx_strength"]
-            result.reasons.append(f"✓ ADX={last['adx']:.1f} (trend forte, +DI > -DI)")
-        else:
-            result.reasons.append(f"✗ ADX={last['adx']:.1f} (trend debole o laterale)")
-
-        # 4. RSI (non in overbought)
-        rsi_val = last["rsi"]
-        if rsi_val < cfg.RSI_OB:
-            partial = w["rsi_ok"] * (1 - max(0, rsi_val - cfg.RSI_OS) /
-                                     (cfg.RSI_OB - cfg.RSI_OS))
-            score += partial
-            result.reasons.append(f"✓ RSI={rsi_val:.1f} (zona neutra/OS)")
-        else:
-            result.reasons.append(f"✗ RSI={rsi_val:.1f} (overbought, evita entrata)")
-
-        # 5. Bollinger Bands (prezzo nella metà inferiore)
-        bb_pos = (last["close"] - last["bb_lower"]) / (
-                  last["bb_upper"] - last["bb_lower"] + 1e-9)
-        if bb_pos < 0.5:
-            score += w["bb_position"] * (1 - bb_pos * 2)
-            result.reasons.append(f"✓ BB: prezzo a {bb_pos*100:.0f}% della banda ({bb_pos:.2f})")
-        else:
-            result.reasons.append(f"✗ BB: prezzo a {bb_pos*100:.0f}% della banda")
-
-        # 6. Volume spike
-        if last["vol_spike"]:
-            score += w["volume_spike"]
-            result.reasons.append("✓ Volume spike rilevato (> 1.5× media)")
-        else:
-            result.reasons.append("✗ Volume nella norma")
-
-        # 7. Order Book Imbalance
-        if ob_imbalance > cfg.OB_IMBALANCE_TH:
-            score += w["ob_imbalance"]
-            result.reasons.append(
-                f"✓ OB Imbalance={ob_imbalance:.2f} (pressione rialzista)")
-        else:
-            result.reasons.append(f"✗ OB Imbalance={ob_imbalance:.2f}")
-
-        # Calcola SL/TP basati su ATR
-        atr_val = last["atr"]
-        result.atr      = atr_val
-        result.sl_price = last["close"] - cfg.ATR_STOP_MULT * atr_val
-        result.tp_price = last["close"] + cfg.ATR_TP_MULT  * atr_val
-        result.score    = round(score, 2)
-        result.buy      = score >= cfg.SIGNAL_THRESHOLD
-        return result
-
-    def check_sell(self, df: pd.DataFrame, position: dict) -> Tuple[bool, str]:
-        """
-        Controlla se uscire dalla posizione.
-        Restituisce (sell: bool, motivo: str).
-        """
-        if len(df) < 3:
-            return False, ""
-        last = df.iloc[-1]
-        price = last["close"]
-
-        # 1. Trailing Stop Loss (aggiornato da RiskManager)
-        sl = position.get("trailing_sl", position.get("sl_price", 0))
-        if sl and price <= sl:
-            return True, f"🛑 Trailing Stop Loss: {price:.4f} ≤ {sl:.4f}"
-
-        # 2. Take Profit fisso
-        tp = position.get("tp_price", 0)
-        if tp and price >= tp:
-            return True, f"🎯 Take Profit: {price:.4f} ≥ {tp:.4f}"
-
-        # 3. EMA cross ribassista
-        if last["ema_fast"] < last["ema_slow"]:
-            # Conferma con ADX in calo: evita falsi segnali
-            if last["adx"] < self.cfg.ADX_MIN or last["di_minus"] > last["di_plus"]:
-                return True, "📉 EMA cross ribassista + ADX debole/inversione"
-
-        return False, ""
+            print(f"    W{win.idx + 1:>2}: offset [{win.start_offset}:{win.end_offset}]  ({candles_info})")
+    print(f"  {'─'*60}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  5. RISK MANAGER
+#  DATA CACHE
 # ══════════════════════════════════════════════════════════════════════════════
 
-class RiskManager:
+CACHE_DIR = ".ohlcv_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def _cache_path(symbol: str, interval: str, days: int) -> str:
+    return os.path.join(CACHE_DIR, f"{symbol}_{interval}_{days}d.parquet")
+
+
+def fetch_klines(symbol: str, interval: str, days: int,
+                 force_download: bool = False) -> pd.DataFrame:
     """
-    Gestisce la dimensione della posizione e i limiti di rischio.
-
-    KELLY CRITERION (frazionato):
-    ─────────────────────────────
-    f* = (W * R - L) / R
-    dove:
-      W = win rate storica  (es. 0.55)
-      L = 1 - W            (loss rate)
-      R = reward/risk ratio (es. ATR_TP_MULT / ATR_STOP_MULT = 1.5)
-
-    Si usa f* × KELLY_FRACTION (quarter-Kelly di default) per ridurre
-    la varianza e proteggersi da stime imprecise di W.
-    Il risultato viene clampato in [MIN_KELLY_BET, MAX_KELLY_BET].
+    Scarica le candele OHLCV da Binance e le mette in cache (.parquet).
+    Se il file esiste ed è recente (<1h), riusa la cache.
     """
+    cache_file = _cache_path(symbol, interval, days)
+    if not force_download and os.path.exists(cache_file):
+        age = time.time() - os.path.getmtime(cache_file)
+        if age < 3600:
+            return pd.read_parquet(cache_file)
 
-    def __init__(self, cfg: Config, logger: logging.Logger):
-        self.cfg    = cfg
-        self.log    = logger
-        self._daily_start_equity: Optional[float] = None
-        self._daily_date:         Optional[str]   = None
-        self.trading_halted:      bool             = False
+    print(f"  ↓ Download {symbol} [{interval}] {days}d ...", end="", flush=True)
+    end_dt   = datetime.utcnow()
+    start_dt = end_dt - timedelta(days=days)
+    url      = "https://api.binance.com/api/v3/klines"
+    all_rows = []
+    current  = start_dt
 
-    def kelly_position_size(self, win_rate: float,
-                             equity: float,
-                             atr: float,
-                             entry_price: float) -> float:
-        """
-        Ritorna l'importo in USDC da investire per questa trade.
+    while True:
+        params = {
+            "symbol":    symbol,
+            "interval":  interval,
+            "limit":     1000,
+            "startTime": int(current.timestamp() * 1000),
+            "endTime":   int(end_dt.timestamp() * 1000),
+        }
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            rows = r.json()
+        except Exception as e:
+            print(f" ERRORE: {e}")
+            return pd.DataFrame()
 
-        Parametri:
-          win_rate   : win rate stimata [0, 1]
-          equity     : USDC disponibile
-          atr        : ATR corrente (in USDC)
-          entry_price: prezzo di entrata
-        """
-        cfg = self.cfg
-        # Ratio R = reward/risk basato su multipli ATR
-        R = cfg.ATR_TP_MULT / cfg.ATR_STOP_MULT   # default: 3/2 = 1.5
-        L = 1 - win_rate
+        if not rows:
+            break
+        all_rows.extend(rows)
+        last_ts  = pd.Timestamp(rows[-1][0], unit="ms")
+        current  = last_ts + timedelta(milliseconds=1)
+        if len(rows) < 1000 or last_ts >= end_dt:
+            break
+        time.sleep(0.1)
 
-        # f* = (W*R - L) / R  (Kelly formula)
-        numerator = win_rate * R - L
-        if numerator <= 0:
-            self.log.warning(
-                f"Kelly negativo (W={win_rate:.2f}, R={R:.2f}): edge negativo, skip")
-            return 0.0
+    if not all_rows:
+        print(" [nessun dato]")
+        return pd.DataFrame()
 
-        f_star   = numerator / R
-        f_scaled = f_star * cfg.KELLY_FRACTION   # Quarter-Kelly
-
-        # Clampa tra min e max
-        f_final = max(cfg.MIN_KELLY_BET, min(cfg.MAX_KELLY_BET, f_scaled))
-        amount  = equity * f_final
-
-        self.log.info(
-            f"Kelly: W={win_rate:.2f} R={R:.2f} f*={f_star:.3f} "
-            f"f_scaled={f_scaled:.3f} f_final={f_final:.3f} → {amount:.2f} USDC")
-        return amount
-
-    def update_trailing_stop(self, position: dict, current_price: float) -> dict:
-        """
-        Aggiorna il trailing stop se il prezzo è salito.
-        Trailing SL = max(prezzo corrente - ATR_STOP_MULT × ATR, SL precedente)
-        """
-        atr        = position.get("atr", 0)
-        new_sl     = current_price - self.cfg.ATR_STOP_MULT * atr
-        current_sl = position.get("trailing_sl", position.get("sl_price", 0))
-        if new_sl > current_sl:
-            position["trailing_sl"] = new_sl
-        return position
-
-    def check_daily_drawdown(self, current_equity: float) -> bool:
-        """
-        Controlla se la perdita giornaliera supera il limite.
-        Ritorna True se il trading deve essere bloccato.
-        """
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        if self._daily_date != today:
-            self._daily_date         = today
-            self._daily_start_equity = current_equity
-            self.trading_halted      = False
-            self.log.info(f"Nuovo giorno: equity di partenza = {current_equity:.2f} USDC")
-
-        if self._daily_start_equity and self._daily_start_equity > 0:
-            dd = (self._daily_start_equity - current_equity) / self._daily_start_equity
-            if dd >= self.cfg.DAILY_DRAWDOWN_LIMIT:
-                if not self.trading_halted:
-                    self.trading_halted = True
-                    self.log.error(
-                        f"⚠️ DAILY DRAWDOWN LIMIT raggiunto: -{dd*100:.2f}% "
-                        f"(limite: -{self.cfg.DAILY_DRAWDOWN_LIMIT*100:.1f}%). "
-                        f"Trading BLOCCATO per oggi.")
-                return True
-        return False
-
-    def estimate_win_rate(self, trade_log: List[dict]) -> float:
-        """
-        Stima la win rate dalle ultime N trade chiuse.
-        Usa le ultime 50 trade per relevanza statistica.
-        Se non ci sono dati sufficienti restituisce 0.50 (neutro).
-        """
-        closed = [t for t in trade_log if t.get("pnl") is not None][-50:]
-        if len(closed) < 5:
-            return 0.50
-        wins = sum(1 for t in closed if t["pnl"] > 0)
-        return wins / len(closed)
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "trades", "tbav", "tqav", "ignore"])
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
+    df.to_parquet(cache_file, index=False)
+    print(f" {len(df)} candele OK")
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  6. BINANCE CLIENT (SYNC WRAPPER CON RETRY)
+#  FAST VECTORIZED BACKTEST
 # ══════════════════════════════════════════════════════════════════════════════
 
-class BinanceClient:
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _rsi(close: pd.Series, period: int) -> pd.Series:
+    delta    = close.diff()
+    gain     = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss     = (-delta).clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    rs       = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _atr(df: pd.DataFrame, period: int) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_c = close.shift(1)
+    tr     = pd.concat([high - low,
+                        (high - prev_c).abs(),
+                        (low  - prev_c).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def _adx(df: pd.DataFrame, period: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """Ritorna (ADX, +DI, -DI)."""
+    high, low = df["high"], df["low"]
+    atr       = _atr(df, period)
+
+    up   = high.diff().clip(lower=0)
+    down = (-low.diff()).clip(lower=0)
+    up[up < down]     = 0
+    down[down < up]   = 0
+
+    alpha    = 1 / period
+    di_plus  = 100 * up.ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, np.nan)
+    di_minus = 100 * down.ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, np.nan)
+    dx       = (100 * (di_plus - di_minus).abs() /
+                (di_plus + di_minus).replace(0, np.nan))
+    adx_val  = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx_val, di_plus, di_minus
+
+
+def compute_signals(df: pd.DataFrame, p: ParamSet) -> pd.DataFrame:
     """
-    Wrapper attorno al Client sincrono di python-binance con:
-    - Retry esponenziale con jitter per errori transitori
-    - Rate limiting (contatore interno delle chiamate al minuto)
-    - Controllo slippage prima dell'esecuzione dell'ordine
+    Calcolo vettoriale di tutti gli indicatori e dei segnali BUY/SELL.
+
+    PUNTEGGIO BUY (max 100):
+      25 pt — EMA trend:   close > EMA(ema_trend)  [opzionale se ema_trend==0]
+      20 pt — EMA cross:   EMA(fast) > EMA(slow)
+      15 pt — ADX:         ADX > adx_min e +DI > -DI [opzionale se adx_min==0]
+      15 pt — RSI:         RSI < rsi_ob (bonus pieno se RSI < rsi_os)
+      10 pt — Bollinger:   close < BB_middle
+      10 pt — Volume:      volume > vol_mult × SMA(volume, 20)
+       5 pt — Neutro OB:   fisso 0.5 (order book non disponibile in backtest)
+
+    BUY  → score >= signal_threshold
+    SELL → EMA(fast) < EMA(slow)  [conferma con barra precedente]
     """
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
+    volume = df["volume"]
 
-    def __init__(self, cfg: Config, logger: logging.Logger):
-        self.cfg    = cfg
-        self.log    = logger
-        self.client: Optional[Client] = None
-        self._request_times: deque = deque(maxlen=1200)  # ultime 1200 req
+    ema_f  = _ema(close, p.ema_fast)
+    ema_s  = _ema(close, p.ema_slow)
 
-    def connect(self):
-        if not _HAS_BINANCE:
-            raise RuntimeError("python-binance non installato")
-        self.client = Client(self.cfg.API_KEY, self.cfg.API_SECRET)
-        self.client.session.timeout = 30
-        self.log.info("Connessione Binance stabilita")
+    if p.ema_trend > 0:
+        ema_t     = _ema(close, p.ema_trend)
+        trend_ok  = (close > ema_t).astype(float)
+    else:
+        trend_ok  = pd.Series(1.0, index=df.index)
 
-    def _rate_check(self):
-        """Rispetta il limite di 1200 richieste/minuto di Binance."""
-        now = time.time()
-        # Rimuovi richieste più vecchie di 60s
-        while self._request_times and now - self._request_times[0] > 60:
-            self._request_times.popleft()
-        if len(self._request_times) >= 1100:   # margine di sicurezza
-            sleep_time = 60 - (now - self._request_times[0]) + 1
-            self.log.warning(f"Rate limit: attendo {sleep_time:.1f}s")
-            time.sleep(sleep_time)
-        self._request_times.append(time.time())
+    if p.adx_min > 0:
+        adx_val, di_plus, di_minus = _adx(df, p.adx_period)
+        adx_ok = ((adx_val > p.adx_min) & (di_plus > di_minus)).astype(float)
+    else:
+        adx_ok = pd.Series(1.0, index=df.index)
 
-    def request(self, func, *args, max_retries=4, **kwargs):
-        """
-        Esegue una chiamata API con retry esponenziale + jitter.
-        Jitter evita la sincronizzazione di più bot sullo stesso server.
-        """
-        delay = 1.0
-        for attempt in range(max_retries):
+    rsi = _rsi(close, p.rsi_period)
+    rsi_score = np.where(
+        rsi < p.rsi_os, 15.0,
+        np.where(rsi < p.rsi_ob,
+                 15.0 * (p.rsi_ob - rsi) / (p.rsi_ob - p.rsi_os + 1e-9),
+                 0.0))
+
+    atr = _atr(df, p.atr_period)
+
+    bb_mid = close.rolling(p.bb_period).mean()
+    bb_ok  = (close < bb_mid).astype(float)
+
+    vol_ma = volume.rolling(20).mean()
+    vol_ok = (volume > vol_ma * p.vol_mult).astype(float)
+
+    score = (
+        trend_ok * 25.0 +
+        (ema_f > ema_s).astype(float) * 20.0 +
+        adx_ok  * 15.0 +
+        rsi_score +
+        bb_ok   * 10.0 +
+        vol_ok  * 10.0 +
+        2.5
+    )
+
+    buy_sig  = (score >= p.signal_threshold)
+    sell_sig = ((ema_f < ema_s) &
+                (ema_f.shift(1) >= ema_s.shift(1)))
+
+    return pd.DataFrame({
+        "close": close.values,
+        "high":  high.values,
+        "low":   low.values,
+        "atr":   atr.values,
+        "score": score.values,
+        "buy":   buy_sig.values,
+        "sell":  sell_sig.values,
+    }, index=df.index)
+
+
+@dataclass
+class BacktestResult:
+    """Metriche di un singolo backtest."""
+    symbol:        str
+    n_trades:      int
+    win_rate:      float
+    total_return:  float
+    profit_factor: float
+    max_drawdown:  float
+    sharpe:        float
+    avg_duration:  float
+    final_capital: float
+    composite:     float
+
+
+def simulate(sig: pd.DataFrame, p: ParamSet,
+             initial_capital: float = 100.0,
+             symbol: str = "?") -> BacktestResult:
+    """
+    Simula le trade con gestione intra-candela di SL e TP.
+
+    Per ogni candela IN posizione:
+      - Se low  <= SL → uscita al prezzo SL (ipotesi peggiore intra-barra)
+      - Se high >= TP → uscita al prezzo TP
+      - Se segnale sell → uscita al close
+    Il check SL ha priorità sul TP (conservativo).
+    """
+    capital  = initial_capital
+    position = None
+    trades   = []
+    equity   = [capital]
+
+    arr_close = sig["close"].values
+    arr_high  = sig["high"].values
+    arr_low   = sig["low"].values
+    arr_atr   = sig["atr"].values
+    arr_buy   = sig["buy"].values
+    arr_sell  = sig["sell"].values
+
+    n      = len(sig)
+    warmup = max(p.ema_trend if p.ema_trend > 0 else 0, p.ema_slow) + 5
+
+    for i in range(warmup, n):
+        price = arr_close[i]
+
+        if position is not None:
+            sl    = position["sl"]
+            tp    = position["tp"]
+            entry = position["entry"]
+            qty   = position["qty"]
+
+            exit_price = None
+            if arr_low[i] <= sl:
+                exit_price = sl
+            elif arr_high[i] >= tp:
+                exit_price = tp
+            elif arr_sell[i]:
+                exit_price = price
+
+            if exit_price is not None:
+                gross  = (exit_price - entry) * qty
+                comm   = (exit_price * qty * p.commission +
+                          entry      * qty * p.commission)
+                pnl    = gross - comm
+                capital += pnl
+                trades.append({
+                    "pnl":      pnl,
+                    "pnl_pct":  pnl / position["invested"] * 100,
+                    "duration": i - position["entry_idx"],
+                })
+                position = None
+
+        if position is None and arr_buy[i] and capital >= 10:
+            atr    = arr_atr[i]
+            invest = capital * p.position_pct
+            invest = min(invest, capital)
+            if invest < 5:
+                equity.append(capital)
+                continue
+
+            comm_buy = invest * p.commission
+            qty      = (invest - comm_buy) / price
+            sl       = price - p.atr_stop_mult * atr
+            tp       = price + p.atr_tp_mult  * atr
+
+            position = {
+                "entry":     price,
+                "sl":        sl,
+                "tp":        tp,
+                "qty":       qty,
+                "invested":  invest,
+                "entry_idx": i,
+            }
+
+        equity.append(capital)
+
+    if position is not None:
+        price  = arr_close[-1]
+        pnl    = (price - position["entry"]) * position["qty"]
+        capital += pnl
+        trades.append({
+            "pnl":      pnl,
+            "pnl_pct":  pnl / position["invested"] * 100,
+            "duration": n - 1 - position["entry_idx"],
+        })
+        equity[-1] = capital
+
+    n_trades = len(trades)
+    if n_trades == 0:
+        return BacktestResult(symbol, 0, 0, 0, 0, 0, 0, 0, capital, -999)
+
+    pnls = np.array([t["pnl"] for t in trades])
+    wins = pnls > 0
+
+    gross_profit  = pnls[wins].sum()
+    gross_loss    = abs(pnls[~wins].sum())
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 9.99
+
+    total_return = (capital - initial_capital) / initial_capital * 100
+    win_rate     = wins.sum() / n_trades
+
+    eq   = np.array(equity, dtype=float)
+    peak = np.maximum.accumulate(eq)
+    dd   = (peak - eq) / (peak + 1e-9)
+    max_dd = float(dd.max() * 100)
+
+    eq_ret = np.diff(eq) / (eq[:-1] + 1e-9)
+    if len(eq_ret) > 1 and eq_ret.std() > 1e-9:
+        sharpe = float(eq_ret.mean() / eq_ret.std() * math.sqrt(252))
+    else:
+        sharpe = 0.0
+
+    avg_dur = float(np.mean([t["duration"] for t in trades]))
+
+    trade_bonus = min(1.0, n_trades / 15)
+    composite   = (
+        sharpe        * 0.40 +
+        total_return  * 0.30 +
+        win_rate      * 100  * 0.20 +
+        min(profit_factor, 5.0) * 2 * 0.10
+    ) * trade_bonus
+
+    return BacktestResult(
+        symbol        = symbol,
+        n_trades      = n_trades,
+        win_rate      = float(win_rate * 100),
+        total_return  = float(total_return),
+        profit_factor = float(min(profit_factor, 9.99)),
+        max_drawdown  = float(max_dd),
+        sharpe        = float(sharpe),
+        avg_duration  = float(avg_dur),
+        final_capital = float(capital),
+        composite     = float(composite),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BACKTEST TRIAL — MULTI-WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_backtest_trial(args: Tuple) -> Optional[dict]:
+    """
+    Funzione libera (compatibile con multiprocessing.Pool).
+
+    Per ogni ParamSet esegue il backtest su CIASCUNA finestra temporale,
+    poi aggrega le metriche cross-window con due fattori correttivi:
+
+      consistency_factor = 0.5 + 0.5 × (finestre profittevoli / totale)
+        → penalizza strategie che funzionano solo in certi regimi di mercato
+
+      stability_factor   = 1 / (1 + std_composite × 0.05)
+        → penalizza alta variabilità di performance tra finestre diverse
+
+      composite_finale = mean_composite × consistency_factor × stability_factor
+
+    Riceve: (ParamSet, {symbol: DataFrame}, [TimeWindow], initial_capital, min_trades)
+    Ritorna: dict con metriche aggregate, o None se non valido.
+    """
+    p, data_map, windows, initial_capital, min_trades = args
+
+    # ── Itera su tutte le finestre temporali ─────────────────────────────────
+    per_window: List[dict] = []
+
+    for win in windows:
+        win_results: List[BacktestResult] = []
+
+        for symbol, df in data_map.items():
+            if df.empty:
+                continue
+            start = win.start_offset
+            end   = min(win.end_offset, len(df))
+            if end - start < 60:
+                continue
+            df_win = df.iloc[start:end].reset_index(drop=True)
             try:
-                self._rate_check()
-                return func(*args, **kwargs)
-            except (BinanceRequestException,
-                    requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectTimeout,
-                    requests.exceptions.ConnectionError) as e:
-                if attempt < max_retries - 1:
-                    jitter = random.uniform(0, delay * 0.5)
-                    wait   = delay + jitter
-                    self.log.warning(
-                        f"[{func.__name__}] tentativo {attempt+1} fallito: {e}. "
-                        f"Retry in {wait:.1f}s")
-                    time.sleep(wait)
-                    delay *= 2          # backoff esponenziale
-                else:
-                    self.log.error(f"[{func.__name__}] tutti i retry falliti: {e}")
-                    raise
-            except BinanceAPIException as e:
-                if e.code in (-1003, -1015):   # too many requests
-                    time.sleep(60)
-                    continue
-                raise
+                sig = compute_signals(df_win, p)
+                r   = simulate(sig, p, initial_capital, symbol)
+                win_results.append(r)
+            except Exception:
+                continue
+
+        # Nessun simbolo aveva dati sufficienti in questa finestra
+        if not win_results:
+            per_window.append({"n_trades": 0, "win_rate": 0.0,
+                                "total_return": 0.0, "profit_factor": 0.0,
+                                "max_drawdown": 0.0, "sharpe": 0.0,
+                                "composite": -999.0, "profitable": False})
+            continue
+
+        total_trades_win = sum(r.n_trades for r in win_results)
+
+        if total_trades_win == 0:
+            per_window.append({"n_trades": 0, "win_rate": 0.0,
+                                "total_return": 0.0, "profit_factor": 0.0,
+                                "max_drawdown": 0.0, "sharpe": 0.0,
+                                "composite": -999.0, "profitable": False})
+            continue
+
+        # Media pesata per numero di trade su tutti i simboli della finestra
+        def wavg(attr: str) -> float:
+            weights = [max(r.n_trades, 1) for r in win_results]
+            vals    = [getattr(r, attr) for r in win_results]
+            return sum(v * w for v, w in zip(vals, weights)) / sum(weights)
+
+        comp = wavg("composite")
+        per_window.append({
+            "n_trades":      total_trades_win,
+            "win_rate":      wavg("win_rate"),
+            "total_return":  wavg("total_return"),
+            "profit_factor": wavg("profit_factor"),
+            "max_drawdown":  wavg("max_drawdown"),
+            "sharpe":        wavg("sharpe"),
+            "avg_duration":  wavg("avg_duration"),
+            "composite":     comp,
+            "profitable":    wavg("total_return") > 0,
+        })
+
+    # ── Filtra finestre con almeno un trade ───────────────────────────────────
+    active       = [w for w in per_window if w["n_trades"] > 0]
+    total_trades = sum(w["n_trades"] for w in active)
+
+    if total_trades < min_trades:
         return None
 
-    def get_klines(self, symbol: str, interval: str,
-                   limit: int = 300) -> pd.DataFrame:
-        """Scarica le candele OHLCV e le restituisce come DataFrame."""
-        raw = self.request(self.client.get_klines,
-                           symbol=symbol, interval=interval, limit=limit)
-        if not raw:
-            return pd.DataFrame()
-        df = pd.DataFrame(raw, columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "qav", "trades", "tbav", "tqav", "ignore"])
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = df[col].astype(float)
-        return df[["open_time", "open", "high", "low", "close", "volume"]]
+    n_win        = len(per_window)
+    n_profitable = sum(1 for w in per_window if w.get("profitable", False))
+    consistency  = n_profitable / n_win if n_win > 0 else 0.0
 
-    def get_ticker_price(self, symbol: str) -> float:
-        ticker = self.request(self.client.get_symbol_ticker, symbol=symbol)
-        return float(ticker["price"]) if ticker else 0.0
+    # Media pesata cross-window (peso = numero di trade nella finestra)
+    def cross_avg(key: str) -> float:
+        if not active:
+            return 0.0
+        weights = [max(w["n_trades"], 1) for w in active]
+        vals    = [w.get(key, 0.0) for w in active]
+        return sum(v * wt for v, wt in zip(vals, weights)) / sum(weights)
 
-    def get_order_book(self, symbol: str, limit: int = 20) -> dict:
-        """Restituisce order book grezzo."""
-        return self.request(self.client.get_order_book,
-                            symbol=symbol, limit=limit) or {}
+    mean_composite = cross_avg("composite")
 
-    def ob_imbalance(self, symbol: str) -> float:
-        """
-        Calcola Order Book Imbalance:
-          imbalance = Σ bid_qty / (Σ bid_qty + Σ ask_qty)
-          > 0.5 → più pressione rialzista (bid)
-          < 0.5 → più pressione ribassista (ask)
-        Considera solo i top N livelli (OB_DEPTH_LEVELS).
-        """
-        book = self.get_order_book(symbol, limit=self.cfg.OB_DEPTH_LEVELS * 2)
-        if not book:
-            return 0.5
-        n       = self.cfg.OB_DEPTH_LEVELS
-        bid_vol = sum(float(b[1]) for b in book.get("bids", [])[:n])
-        ask_vol = sum(float(a[1]) for a in book.get("asks", [])[:n])
-        total   = bid_vol + ask_vol
-        return bid_vol / total if total > 0 else 0.5
+    # Deviazione standard del composite tra finestre attive
+    composites    = [w["composite"] for w in active if w["composite"] > -100]
+    composite_std = float(np.std(composites)) if len(composites) > 1 else 0.0
 
-    def get_usdc_balance(self) -> float:
-        bal = self.request(self.client.get_asset_balance, asset="USDC")
-        return float(bal["free"]) if bal else 0.0
+    # ── Punteggio finale robusto ──────────────────────────────────────────────
+    # consistency_factor ∈ [0.5, 1.0]: dimezza il punteggio se nessuna finestra
+    #   è profittevole, lo lascia intatto se tutte lo sono
+    consistency_factor = 0.5 + 0.5 * consistency
 
-    def get_asset_balance(self, asset: str) -> float:
-        bal = self.request(self.client.get_asset_balance, asset=asset)
-        return float(bal["free"]) if bal else 0.0
+    # stability_factor ∈ (0, 1]: penalizza alta variabilità tra finestre
+    stability_factor = 1.0 / (1.0 + composite_std * 0.05)
 
-    def buy_market_quote(self, symbol: str, quote_amount: float,
-                         ref_price: float) -> Optional[dict]:
-        """
-        Ordine BUY a mercato con controllo slippage.
-        Se il prezzo corrente si discosta più di MAX_SLIPPAGE_PCT
-        dal prezzo di riferimento, l'ordine viene annullato.
-        """
-        current = self.get_ticker_price(symbol)
-        if ref_price > 0:
-            slip = abs(current - ref_price) / ref_price
-            if slip > self.cfg.MAX_SLIPPAGE_PCT:
-                self.log.warning(
-                    f"Slippage eccessivo {symbol}: {slip*100:.3f}% > "
-                    f"{self.cfg.MAX_SLIPPAGE_PCT*100:.3f}%. Ordine annullato.")
-                return None
+    final_composite = mean_composite * consistency_factor * stability_factor
 
-        q = float(Decimal(str(quote_amount)).quantize(
-            Decimal("0.01"), rounding=ROUND_DOWN))
-        if q < self.cfg.MIN_USDC_TRADE:
-            self.log.warning(f"Quote amount {q} < minimo {self.cfg.MIN_USDC_TRADE}")
-            return None
-
-        return self.request(
-            self.client.create_order,
-            symbol=symbol, side="BUY", type="MARKET", quoteOrderQty=q)
-
-    def sell_market_qty(self, symbol: str, qty: float) -> Optional[dict]:
-        """Ordine SELL a mercato per tutta la quantità disponibile."""
-        info = self.request(self.client.get_symbol_info, symbol)
-        if not info:
-            return None
-        # Adatta qty allo stepSize
-        step = next((float(f["stepSize"])
-                     for f in info["filters"] if f["filterType"] == "LOT_SIZE"),
-                    0.001)
-        decimals = max(0, -int(math.floor(math.log10(step))))
-        adj_qty  = float(
-            (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(
-                ROUND_DOWN) * Decimal(str(step)))
-        if adj_qty <= 0:
-            return None
-        return self.request(
-            self.client.create_order,
-            symbol=symbol, side="SELL", type="MARKET",
-            quantity=round(adj_qty, decimals))
+    row = asdict(p)
+    row.pop("SEARCH_SPACE", None)
+    row.update({
+        "_n_trades":          total_trades,
+        "_win_rate":          cross_avg("win_rate"),
+        "_total_return":      cross_avg("total_return"),
+        "_profit_factor":     cross_avg("profit_factor"),
+        "_max_drawdown":      cross_avg("max_drawdown"),
+        "_sharpe":            cross_avg("sharpe"),
+        "_avg_duration":      cross_avg("avg_duration"),
+        "_composite":         final_composite,
+        "_mean_composite":    mean_composite,
+        "_consistency":       consistency * 100.0,    # in %
+        "_composite_std":     composite_std,
+        "_n_windows":         n_win,
+        "_n_windows_active":  len(active),
+        "_final_capital":     initial_capital * (1 + cross_avg("total_return") / 100),
+        "_n_symbols_traded":  len([r for r in win_results if r.n_trades > 0]),
+    })
+    return row
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  7. POSITION MANAGER
+#  OPTIMIZER
 # ══════════════════════════════════════════════════════════════════════════════
 
-class PositionManager:
-    """Mantiene lo stato delle posizioni aperte con persistenza JSON e log CSV."""
+class Optimizer:
 
-    def __init__(self, cfg: Config, logger: logging.Logger):
-        self.cfg       = cfg
-        self.log       = logger
-        self.positions: Dict[str, Optional[dict]] = {}
-        self.trade_log: List[dict] = []
+    def __init__(self,
+                 symbols:         List[str],
+                 interval:        str,
+                 days:            int,
+                 initial_capital: float,
+                 min_trades:      int,
+                 n_jobs:          int,
+                 top_n:           int,
+                 output_csv:      str):
+        self.symbols         = symbols
+        self.interval        = interval
+        self.days            = days
+        self.initial_capital = initial_capital
+        self.min_trades      = min_trades
+        self.n_jobs          = n_jobs
+        self.top_n           = top_n
+        self.output_csv      = output_csv
+        self.data_map:        Dict[str, pd.DataFrame] = {}
 
-    def load(self):
-        if os.path.exists(self.cfg.STATE_FILE):
-            try:
-                with open(self.cfg.STATE_FILE) as f:
-                    state = json.load(f)
-                self.positions = state.get("positions", {})
-                self.log.info(f"Stato caricato da {self.cfg.STATE_FILE}")
-            except Exception as e:
-                self.log.error(f"Errore caricamento stato: {e}")
-        # Carica trade log
-        if os.path.exists(self.cfg.TRADE_LOG):
-            try:
-                with open(self.cfg.TRADE_LOG, newline="") as f:
-                    self.trade_log = list(csv.DictReader(f))
-            except Exception:
-                pass
+    def load_data(self, force_download: bool = False):
+        print(f"\n{'─'*60}")
+        print(f"  Scaricamento dati [{self.interval}] | {self.days} giorni")
+        print(f"{'─'*60}")
+        for sym in self.symbols:
+            df = fetch_klines(sym, self.interval, self.days,
+                              force_download=force_download)
+            if not df.empty:
+                self.data_map[sym] = df
+        loaded = list(self.data_map.keys())
+        print(f"  Simboli caricati: {len(loaded)}/{len(self.symbols)}: {loaded}")
 
-    def save(self):
-        try:
-            with open(self.cfg.STATE_FILE, "w") as f:
-                json.dump({"ts": datetime.utcnow().isoformat(),
-                           "positions": self.positions}, f, indent=2)
-        except Exception as e:
-            self.log.error(f"Errore salvataggio stato: {e}")
+    def _build_args(self, param_list: List[ParamSet],
+                    windows: List[TimeWindow]) -> List[Tuple]:
+        return [(p, self.data_map, windows, self.initial_capital, self.min_trades)
+                for p in param_list]
 
-    def open_position(self, symbol: str, entry_price: float,
-                      qty: float, invested: float,
-                      sl: float, tp: float, atr: float):
-        self.positions[symbol] = {
-            "entry_price":  entry_price,
-            "qty":          qty,
-            "invested":     invested,
-            "sl_price":     sl,
-            "trailing_sl":  sl,
-            "tp_price":     tp,
-            "atr":          atr,
-            "open_time":    datetime.utcnow().isoformat(),
-        }
-        self._csv_log(symbol, "BUY", entry_price, qty, invested)
-        self.save()
+    def run(self, param_list: List[ParamSet],
+            windows: List[TimeWindow]) -> List[dict]:
+        total = len(param_list)
+        print(f"\n{'─'*60}")
+        print(f"  Avvio ottimizzazione: {total} combinazioni | "
+              f"{len(windows)} finestre | {self.n_jobs} job paralleli")
+        print(f"{'─'*60}")
 
-    def close_position(self, symbol: str, exit_price: float, qty: float, reason: str):
-        pos = self.positions.get(symbol)
-        pnl = 0.0
-        if pos:
-            pnl = (exit_price - pos["entry_price"]) * qty
-            pnl_pct = pnl / pos["invested"] * 100 if pos["invested"] else 0
-            self._csv_log(symbol, "SELL", exit_price, qty, pos["invested"], pnl, pnl_pct)
-            self.trade_log.append({
-                "symbol": symbol, "pnl": pnl,
-                "pnl_pct": pnl_pct, "reason": reason
-            })
-            self.log.info(
-                f"CLOSE {symbol} @ {exit_price:.4f} | "
-                f"PnL={pnl:+.2f} USDC ({pnl_pct:+.2f}%) | {reason}")
-        self.positions[symbol] = None
-        self.save()
-        return pnl
+        args    = self._build_args(param_list, windows)
+        results = []
+        t0      = time.time()
 
-    def _csv_log(self, symbol, action, price, qty, invested,
-                 pnl=None, pnl_pct=None):
-        entry = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "symbol": symbol, "action": action,
-            "price": price, "qty": qty, "invested": invested,
-            "pnl": pnl or 0, "pnl_pct": pnl_pct or 0,
-        }
-        exists = os.path.exists(self.cfg.TRADE_LOG)
-        try:
-            with open(self.cfg.TRADE_LOG, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=entry.keys())
-                if not exists:
-                    w.writeheader()
-                w.writerow(entry)
-        except Exception as e:
-            self.log.error(f"CSV log error: {e}")
+        if self.n_jobs <= 1:
+            for i, a in enumerate(args, 1):
+                r = run_backtest_trial(a)
+                if r is not None:
+                    results.append(r)
+                if i % max(1, total // 20) == 0:
+                    elapsed = time.time() - t0
+                    eta     = elapsed / i * (total - i)
+                    print(f"  [{i:>5}/{total}] trovate {len(results)} config valide "
+                          f"| ETA {eta:.0f}s    ", end="\r")
+        else:
+            chunksize = max(1, total // (self.n_jobs * 4))
+            with Pool(processes=self.n_jobs) as pool:
+                for i, r in enumerate(
+                        pool.imap_unordered(run_backtest_trial, args,
+                                            chunksize=chunksize), 1):
+                    if r is not None:
+                        results.append(r)
+                    if i % max(1, total // 20) == 0:
+                        elapsed = time.time() - t0
+                        eta     = elapsed / i * (total - i)
+                        print(f"  [{i:>5}/{total}] trovate {len(results)} config valide "
+                              f"| ETA {eta:.0f}s    ", end="\r")
 
-    def open_count(self) -> int:
-        return sum(1 for v in self.positions.values() if v)
+        elapsed = time.time() - t0
+        print(f"\n\n  ✓ Completato in {elapsed:.1f}s | "
+              f"{len(results)}/{total} config valide "
+              f"(min_trades={self.min_trades})")
 
-    def is_open(self, symbol: str) -> bool:
-        return bool(self.positions.get(symbol))
+        results.sort(key=lambda x: x["_composite"], reverse=True)
+        return results[:self.top_n * 3]
 
-    def get(self, symbol: str) -> Optional[dict]:
-        return self.positions.get(symbol)
-
-    def set(self, symbol: str, pos: dict):
-        self.positions[symbol] = pos
-        self.save()
-
-    def stats(self) -> dict:
-        closed = [t for t in self.trade_log if "pnl" in t]
-        if not closed:
-            return {"total": 0, "wins": 0, "total_pnl": 0,
-                    "win_rate": 0.5, "avg_pnl": 0}
-        pnls  = [float(t["pnl"]) for t in closed]
-        wins  = sum(1 for p in pnls if p > 0)
-        return {
-            "total":    len(pnls),
-            "wins":     wins,
-            "total_pnl": sum(pnls),
-            "win_rate": wins / len(pnls),
-            "avg_pnl":  sum(pnls) / len(pnls),
-            "best":     max(pnls),
-            "worst":    min(pnls),
-        }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  8. TELEGRAM HANDLER
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TelegramHandler:
-    """Gestisce i comandi Telegram in un thread separato."""
-
-    def __init__(self, cfg: Config, logger: logging.Logger,
-                 pm: PositionManager, bc: BinanceClient):
-        self.cfg    = cfg
-        self.log    = logger
-        self.pm     = pm
-        self.bc     = bc
-        self.trading_enabled = True
-        self.start_time      = datetime.utcnow()
-        self._last_update_id = 0
-
-    def send(self, text: str):
-        if not self.cfg.TELEGRAM_TOKEN or not self.cfg.TELEGRAM_CHAT_ID:
+    def save_results(self, results: List[dict]):
+        if not results:
             return
-        url     = f"https://api.telegram.org/bot{self.cfg.TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": self.cfg.TELEGRAM_CHAT_ID,
-                   "text": text, "parse_mode": "Markdown"}
-        try:
-            requests.post(url, data=payload, timeout=10)
-        except Exception:
-            try:
-                payload.pop("parse_mode")
-                requests.post(url, data=payload, timeout=10)
-            except Exception:
-                pass
+        with open(self.output_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=results[0].keys())
+            w.writeheader()
+            w.writerows(results)
+        print(f"\n  💾 Risultati salvati in: {self.output_csv}")
 
-    def _get_updates(self) -> list:
-        if not self.cfg.TELEGRAM_TOKEN:
-            return []
-        url = f"https://api.telegram.org/bot{self.cfg.TELEGRAM_TOKEN}/getUpdates"
-        try:
-            r = requests.get(url, params={"timeout": 1,
-                                           "offset": self._last_update_id + 1},
-                             timeout=5)
-            if r.status_code == 200:
-                return r.json().get("result", [])
-        except Exception:
-            pass
-        return []
+    def print_leaderboard(self, results: List[dict],
+                          windows: List[TimeWindow]):
+        if not results:
+            print("\n  ⚠️  Nessuna configurazione valida trovata.")
+            print("     Prova a ridurre --min-trades, --windows o allargare lo spazio.")
+            return
 
-    def _uptime(self) -> str:
-        d = datetime.utcnow() - self.start_time
-        h, r = divmod(d.seconds, 3600)
-        m, _ = divmod(r, 60)
-        return f"{d.days}d {h}h {m}m" if d.days else (
-               f"{h}h {m}m" if h else f"{m}m")
+        top = results[:self.top_n]
+        W   = 122
 
-    def handle(self, cmd: str) -> str:
-        cmd = cmd.strip()
-        low = cmd.lower()
+        print(f"\n{'═'*W}")
+        print(f"{'  🏆  LEADERBOARD TOP ' + str(self.top_n) + '  (validazione su ' + str(len(windows)) + ' finestre)':^{W}}")
+        print(f"{'═'*W}")
 
-        if low in ("/status", "/info", "status", "info"):
-            st     = self.pm.stats()
-            equity = self.bc.get_usdc_balance()
-            op     = self.pm.open_count()
-            ts     = "🟢 ATTIVO" if self.trading_enabled else "🔴 SOSPESO"
-            return (
-                f"🤖 *BOT v2.0 STATUS*\n\n"
-                f"⏰ Uptime: {self._uptime()}\n"
-                f"🎛️ Trading: {ts}\n"
-                f"💰 USDC libero: {equity:.2f}\n"
-                f"📈 Posizioni aperte: {op}/{self.cfg.MAX_OPEN_POSITIONS}\n\n"
-                f"📋 Trade chiuse: {st['total']}\n"
-                f"🎯 Win rate: {st['win_rate']*100:.1f}%\n"
-                f"💎 PnL totale: {st['total_pnl']:+.2f} USDC\n"
-                f"📊 PnL medio: {st.get('avg_pnl',0):+.2f} USDC\n"
-                f"🚀 Miglior trade: {st.get('best',0):+.2f} USDC\n"
-                f"📉 Peggior trade: {st.get('worst',0):+.2f} USDC"
+        # ── Header ────────────────────────────────────────────────────────────
+        cols = [
+            ("Rk",    3), ("EMAf", 5), ("EMAs", 5), ("EMAt", 5),
+            ("ADXm",  5), ("RSIob",6), ("SLx",  5), ("TPx",  5),
+            ("Thr",   5), ("POS%", 5),
+            ("N#",    5), ("WR%",  6), ("Ret%", 7),
+            ("PF",    5), ("DD%",  6), ("Sharpe",7),
+            ("Cons%", 7), ("Std",  6), ("Score", 7),
+        ]
+        header = "".join(f"{c[0]:>{c[1]}}" for c in cols)
+        print(f"  {header}")
+        print(f"  {'─'*(W-2)}")
+
+        for rank, row in enumerate(top, 1):
+            line = (
+                f"  {rank:>3}"
+                f"  {row['ema_fast']:>3}"
+                f"  {row['ema_slow']:>3}"
+                f"  {row['ema_trend']:>3}"
+                f"  {row['adx_min']:>3.0f}"
+                f"  {row['rsi_ob']:>4.0f}"
+                f"  {row['atr_stop_mult']:>3.1f}"
+                f"  {row['atr_tp_mult']:>3.1f}"
+                f"  {row['signal_threshold']:>3.0f}"
+                f"  {row['position_pct']*100:>4.0f}"
+                f"  {row['_n_trades']:>4}"
+                f"  {row['_win_rate']:>5.1f}"
+                f"  {row['_total_return']:>+6.1f}"
+                f"  {row['_profit_factor']:>4.2f}"
+                f"  {row['_max_drawdown']:>5.1f}"
+                f"  {row['_sharpe']:>+6.2f}"
+                f"  {row['_consistency']:>6.1f}"
+                f"  {row['_composite_std']:>5.2f}"
+                f"  {row['_composite']:>+6.2f}"
             )
+            if rank <= 3:
+                line = "🥇" + line[1:] if rank == 1 else \
+                       "🥈" + line[1:] if rank == 2 else "🥉" + line[1:]
+            print(line)
 
-        if low in ("/stop", "stop", "/pause", "pause"):
-            self.trading_enabled = False
-            return "🔴 Trading SOSPESO. Posizioni aperte rimangono attive."
+        print(f"  {'─'*(W-2)}")
+        print(f"  Colonne: EMAf/s/t=periodi EMA fast/slow/trend | ADXm=ADX min | "
+              f"RSIob=RSI overbought | SLx/TPx=moltiplicatori ATR")
+        print(f"           Thr=soglia score | POS%=% capitale/trade | N#=N.trade totali "
+              f"(tutte le finestre)")
+        print(f"           WR%=winrate | Ret%=rendimento medio | PF=profit factor | "
+              f"DD%=max drawdown medio")
+        print(f"           Cons%=% finestre con rendimento positivo | "
+              f"Std=deviazione composite tra finestre | Score=composite finale")
+        print(f"{'═'*W}")
 
-        if low in ("/start", "start", "/resume", "resume"):
-            self.trading_enabled = True
-            return "🟢 Trading RIATTIVATO."
+        # ── Dettaglio configurazione #1 ───────────────────────────────────────
+        best = top[0]
+        n_win_active = int(best.get("_n_windows_active", len(windows)))
+        n_win_total  = int(best.get("_n_windows", len(windows)))
 
-        if low in ("/positions", "positions"):
-            open_pos = {k: v for k, v in self.pm.positions.items() if v}
-            if not open_pos:
-                return "📈 Nessuna posizione aperta."
-            lines = ["📈 *POSIZIONI APERTE*\n"]
-            for sym, pos in open_pos.items():
-                price = self.bc.get_ticker_price(sym)
-                pnl   = (price - pos["entry_price"]) * pos["qty"]
-                pct   = pnl / pos["invested"] * 100 if pos["invested"] else 0
-                lines.append(
-                    f"*{sym}*: entry={pos['entry_price']:.4f} "
-                    f"now={price:.4f} PnL={pnl:+.2f}USDC ({pct:+.1f}%)\n"
-                    f"  SL={pos.get('trailing_sl',0):.4f} "
-                    f"TP={pos.get('tp_price',0):.4f}")
-            return "\n".join(lines)
+        print(f"\n  ★ CONFIGURAZIONE OTTIMALE (rank #1):")
+        print(f"  {'─'*55}")
+        param_keys = [f.name for f in fields(ParamSet())
+                      if f.name != "SEARCH_SPACE"]
+        for k in param_keys:
+            if k in best:
+                print(f"    {k:<25} = {best[k]}")
 
-        if low in ("/help", "help"):
-            return (
-                "🤖 *COMANDI BOT v2.0*\n\n"
-                "/status — stato completo\n"
-                "/positions — posizioni aperte + SL/TP\n"
-                "/stop — sospendi nuovi acquisti\n"
-                "/start — riattiva acquisti\n"
-                "/help — questo messaggio"
-            )
+        print(f"\n  Performance aggregata su {n_win_total} finestre "
+              f"[{self.interval}] {self.days}d | capitale {self.initial_capital:.0f} USDC:")
+        print(f"    Trade totali   : {best['_n_trades']}  "
+              f"(finestre attive: {n_win_active}/{n_win_total})")
+        print(f"    Win rate medio : {best['_win_rate']:.1f}%")
+        print(f"    Rendimento medio: {best['_total_return']:+.2f}%")
+        print(f"    Profit Factor  : {best['_profit_factor']:.2f}")
+        print(f"    Max Drawdown   : {best['_max_drawdown']:.2f}%")
+        print(f"    Sharpe ratio   : {best['_sharpe']:.2f}")
+        print(f"    ─── Robustezza ───────────────────────────")
+        print(f"    Consistenza    : {best['_consistency']:.1f}%  "
+              f"({int(round(best['_consistency']*n_win_total/100))}/{n_win_total} "
+              f"finestre profittevoli)")
+        print(f"    Stabilità (Std): {best['_composite_std']:.3f}  "
+              f"(più basso = più stabile)")
+        print(f"    Score composito: {best['_mean_composite']:+.2f} (grezzo) "
+              f"→ {best['_composite']:+.2f} (aggiustato)")
+        print(f"  {'─'*55}")
 
-        return "❓ Comando non riconosciuto. Usa /help."
+        # ── Snippet Python per il bot ─────────────────────────────────────────
+        print(f"\n  📋 SNIPPET — copia in Config() del tuo bot:")
+        print(f"  {'─'*55}")
+        print(f"  cfg = Config(")
+        snippet_keys = [
+            "ema_fast", "ema_slow", "ema_trend",
+            "adx_period", "adx_min",
+            "rsi_period", "rsi_ob", "rsi_os",
+            "atr_period", "atr_stop_mult", "atr_tp_mult",
+            "bb_period", "bb_std",
+            "vol_mult", "signal_threshold", "position_pct",
+        ]
+        for k in snippet_keys:
+            if k in best:
+                print(f"      {k.upper():<25} = {best[k]},")
+        print(f"  )")
+        print(f"  {'─'*55}")
 
-    def run_forever(self):
-        self.log.info("Telegram handler avviato")
-        while True:
-            try:
-                updates = self._get_updates()
-                for upd in updates:
-                    self._last_update_id = upd.get("update_id", 0)
-                    msg = upd.get("message", {})
-                    chat_id = str(msg.get("chat", {}).get("id", ""))
-                    if chat_id == self.cfg.TELEGRAM_CHAT_ID and "text" in msg:
-                        text = msg["text"]
-                        self.log.info(f"Telegram cmd: {text}")
-                        reply = self.handle(text)
-                        self.send(reply)
-            except Exception as e:
-                self.log.error(f"Telegram error: {e}")
-            time.sleep(2)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  9. TRADING BOT (ORCHESTRATORE)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TradingBot:
-    """
-    Orchestratore principale. Gira in un loop sincrono ogni LOOP_SLEEP_SEC.
-    Per ogni simbolo:
-      1. Scarica le candele più recenti
-      2. Calcola gli indicatori
-      3. Calcola OB Imbalance (real-time via REST)
-      4. Valuta segnali di entrata/uscita
-      5. Esegue gli ordini con controllo del rischio
-    """
-
-    def __init__(self, cfg: Config):
-        self.cfg  = cfg
-        self.log  = build_logger(cfg.LOG_FILE)
-        self.bc   = BinanceClient(cfg, self.log)
-        self.pm   = PositionManager(cfg, self.log)
-        self.strat = Strategy(cfg)
-        self.ind   = IndicatorEngine()
-        self.rm    = RiskManager(cfg, self.log)
-        self.tg    = TelegramHandler(cfg, self.log, self.pm, self.bc)
-        self._candle_cache: Dict[str, pd.DataFrame] = {}
-
-    def start(self):
-        self.bc.connect()
-        self.pm.load()
-
-        # Inizializza posizioni per simboli mancanti
-        for sym in self.cfg.SYMBOLS:
-            if sym not in self.pm.positions:
-                self.pm.positions[sym] = None
-
-        self.log.info(
-            f"Bot avviato su {self.cfg.SYMBOLS} [{self.cfg.INTERVAL}]")
-        self.tg.send(
-            f"🤖 *Bot v2.0 avviato*\n"
-            f"Simboli: {', '.join(self.cfg.SYMBOLS)}\n"
-            f"Intervallo: {self.cfg.INTERVAL}\n"
-            f"Usa /status per monitorare.")
-
-        # Thread Telegram separato (daemon: termina con il processo principale)
-        t = threading.Thread(target=self.tg.run_forever, daemon=True)
-        t.start()
-
-        try:
-            while True:
-                self._cycle()
-                time.sleep(self.cfg.LOOP_SLEEP_SEC)
-        except KeyboardInterrupt:
-            self.log.info("Interruzione manuale — salvo stato e uscita")
-        finally:
-            self.pm.save()
-            self.tg.send(f"🛑 Bot v2.0 terminato. Uptime: {self.tg._uptime()}")
-
-    def _cycle(self):
-        """Un ciclo completo su tutti i simboli."""
-        equity = self.bc.get_usdc_balance()
-        halted = self.rm.check_daily_drawdown(equity)
-        win_rate = self.rm.estimate_win_rate(self.pm.trade_log)
-
-        for symbol in self.cfg.SYMBOLS:
-            try:
-                self._process_symbol(symbol, equity, win_rate, halted)
-            except Exception as e:
-                self.log.error(f"Errore su {symbol}: {e}", exc_info=True)
-
-    def _process_symbol(self, symbol: str, equity: float,
-                         win_rate: float, halted: bool):
-        # 1. Candele + indicatori
-        df = self.bc.get_klines(symbol, self.cfg.INTERVAL,
-                                 self.cfg.CANDLE_LIMIT)
-        if df.empty or len(df) < self.cfg.EMA_TREND + 10:
-            return
-        df = self.ind.populate(df, self.cfg)
-
-        position = self.pm.get(symbol)
-
-        # ── GESTIONE POSIZIONE APERTA ─────────────────────────────────────
-        if position:
-            current_price = float(df.iloc[-1]["close"])
-            # Aggiorna trailing stop
-            position = self.rm.update_trailing_stop(position, current_price)
-            self.pm.set(symbol, position)
-
-            # Controlla uscita
-            sell, reason = self.strat.check_sell(df, position)
-            if sell:
-                asset = symbol.replace(self.cfg.QUOTE_ASSET, "")
-                qty   = self.bc.get_asset_balance(asset)
-                if qty > 0:
-                    order = self.bc.sell_market_qty(symbol, qty)
-                    if order:
-                        pnl = self.pm.close_position(
-                            symbol, current_price, qty, reason)
-                        self.tg.send(
-                            f"📤 *SELL {symbol}*\n"
-                            f"Prezzo: {current_price:.4f}\n"
-                            f"PnL: {pnl:+.2f} USDC\n"
-                            f"Motivo: {reason}")
-            return
-
-        # ── VALUTAZIONE INGRESSO ──────────────────────────────────────────
-        if halted or not self.tg.trading_enabled:
-            return
-        if self.pm.open_count() >= self.cfg.MAX_OPEN_POSITIONS:
-            return
-
-        # Order Book Imbalance (solo se non in posizione, risparmia API calls)
-        ob_imb = self.bc.ob_imbalance(symbol)
-
-        signal = self.strat.score_buy(df, ob_imb)
-        last   = df.iloc[-1]
-        self.log.debug(
-            f"{symbol} score={signal.score:.1f} "
-            f"(soglia={self.cfg.SIGNAL_THRESHOLD}) OBI={ob_imb:.2f}")
-
-        if not signal.buy:
-            return
-
-        # Dimensione posizione (Kelly)
-        invest = self.rm.kelly_position_size(
-            win_rate, equity, signal.atr, last["close"])
-        if invest < self.cfg.MIN_USDC_TRADE:
-            self.log.info(
-                f"{symbol}: Kelly amount {invest:.2f} < minimo. Skip.")
-            return
-        # Non superare il disponibile
-        invest = min(invest, equity * 0.95)
-
-        # Esegui BUY
-        ref_price = last["close"]
-        order = self.bc.buy_market_quote(symbol, invest, ref_price)
-        if not order:
-            return
-
-        # Recupera dati ordine eseguito
-        filled_qty   = float(order.get("executedQty", 0))
-        executed_val = float(order.get("cummulativeQuoteQty", invest))
-        entry_price  = executed_val / filled_qty if filled_qty > 0 else ref_price
-
-        self.pm.open_position(
-            symbol      = symbol,
-            entry_price = entry_price,
-            qty         = filled_qty,
-            invested    = executed_val,
-            sl          = signal.sl_price,
-            tp          = signal.tp_price,
-            atr         = signal.atr,
-        )
-
-        reasons_txt = "\n".join(f"  {r}" for r in signal.reasons)
-        self.tg.send(
-            f"📥 *BUY {symbol}*\n"
-            f"Prezzo: {entry_price:.4f}\n"
-            f"Qty: {filled_qty:.6f}\n"
-            f"Investito: {executed_val:.2f} USDC\n"
-            f"Score: {signal.score:.1f}/100\n"
-            f"SL: {signal.sl_price:.4f} | TP: {signal.tp_price:.4f}\n\n"
-            f"Segnali:\n{reasons_txt}")
-        self.log.info(
-            f"BUY {symbol} qty={filled_qty:.6f} @ {entry_price:.4f} "
-            f"score={signal.score:.1f} kelly={invest:.2f}USDC")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  10. BACKTEST ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-
-class Backtester:
-    """
-    Backtest vettoriale su dati storici Binance.
-    Simula commissioni (0.1%), slippage (0.05%) e Kelly position sizing.
-    """
-
-    COMMISSION = 0.001     # 0.1% per lato
-    SLIPPAGE   = 0.0005    # 0.05% per lato
-
-    def __init__(self, cfg: Config):
-        self.cfg  = cfg
-        self.log  = build_logger(cfg.LOG_FILE)
-        self.strat = Strategy(cfg)
-        self.ind   = IndicatorEngine()
-        self.rm    = RiskManager(cfg, self.log)
-
-    def _fetch_klines(self, symbol: str, interval: str,
-                      days: int) -> pd.DataFrame:
-        end   = datetime.utcnow()
-        start = end - timedelta(days=days)
-        url   = "https://api.binance.com/api/v3/klines"
-        all_rows = []
-        current_start = start
-        while True:
-            params = {
-                "symbol": symbol, "interval": interval, "limit": 1000,
-                "startTime": int(current_start.timestamp() * 1000),
-                "endTime":   int(end.timestamp() * 1000),
-            }
-            resp = requests.get(url, params=params, timeout=15)
-            if resp.status_code != 200:
-                break
-            rows = resp.json()
-            if not rows:
-                break
-            all_rows.extend(rows)
-            last_ts = pd.Timestamp(rows[-1][0], unit="ms")
-            current_start = last_ts + timedelta(milliseconds=1)
-            if len(rows) < 1000 or last_ts >= end:
-                break
-        if not all_rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(all_rows, columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "qav", "trades", "tbav", "tqav", "ignore"])
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = df[col].astype(float)
-        return df[["open_time", "open", "high", "low", "close", "volume"]]
-
-    def run(self, days: int = 500, initial_capital: float = 100.0):
-        wallet = initial_capital
-        all_trades = []
-        print(f"\n{'═'*60}")
-        print(f"  BACKTEST — {days} giorni | Capitale: {initial_capital:.2f} USDC")
-        print(f"{'═'*60}\n")
-
-        for symbol in self.cfg.SYMBOLS:
-            print(f"\n─── {symbol} ───")
-            df_raw = self._fetch_klines(symbol, self.cfg.INTERVAL, days)
-            if df_raw.empty:
-                print(f"  Nessun dato per {symbol}")
-                continue
-            df = self.ind.populate(df_raw, self.cfg)
-            print(f"  Candele: {len(df)} | dal {df['open_time'].iloc[0].date()}")
-
-            position = None
-            trades   = []
-            trade_log_local = []
-
-            for i in range(self.cfg.EMA_TREND + 5, len(df)):
-                window = df.iloc[:i + 1]
-                row    = window.iloc[-1]
-                price  = row["close"]
-                date   = row["open_time"].strftime("%Y-%m-%d")
-
-                # ── IN POSIZIONE: aggiorna trailing stop, controlla uscita
-                if position:
-                    # Trailing stop
-                    new_sl = price - self.cfg.ATR_STOP_MULT * position["atr"]
-                    if new_sl > position["trailing_sl"]:
-                        position["trailing_sl"] = new_sl
-
-                    sell, reason = self.strat.check_sell(window, position)
-                    if sell:
-                        exit_p = price * (1 - self.SLIPPAGE)
-                        comm   = exit_p * position["qty"] * self.COMMISSION
-                        pnl    = (exit_p - position["entry_price"]) * position["qty"] - comm
-                        wallet += pnl
-                        trades.append({
-                            "symbol": symbol,
-                            "entry":  position["entry_price"],
-                            "exit":   exit_p,
-                            "qty":    position["qty"],
-                            "pnl":    pnl,
-                            "pnl_pct": pnl / position["invested"] * 100,
-                            "reason": reason,
-                            "date":   date,
-                        })
-                        trade_log_local.append({"pnl": pnl})
-                        emoji = "🟢" if pnl > 0 else "🔴"
-                        print(f"  {emoji} {date} SELL @ {exit_p:.4f} | "
-                              f"PnL={pnl:+.2f} | {reason}")
-                        position = None
-                    continue
-
-                # ── FUORI POSIZIONE: valuta ingresso
-                # OB imbalance non disponibile in backtest → 0.5 (neutro)
-                signal = self.strat.score_buy(window, ob_imbalance=0.5)
-                if not signal.buy:
-                    continue
-
-                wr      = self.rm.estimate_win_rate(trade_log_local)
-                invest  = self.rm.kelly_position_size(
-                    wr, wallet, signal.atr, price)
-                invest  = min(invest, wallet * 0.95)
-                if invest < self.cfg.MIN_USDC_TRADE:
-                    continue
-
-                entry_p = price * (1 + self.SLIPPAGE)
-                comm    = invest * self.COMMISSION
-                qty     = (invest - comm) / entry_p
-                wallet -= invest
-
-                position = {
-                    "entry_price":  entry_p,
-                    "qty":          qty,
-                    "invested":     invest,
-                    "sl_price":     signal.sl_price,
-                    "trailing_sl":  signal.sl_price,
-                    "tp_price":     signal.tp_price,
-                    "atr":          signal.atr,
-                }
-                print(f"  📈 {date} BUY  @ {entry_p:.4f} | "
-                      f"Score={signal.score:.0f} Kelly={invest:.2f}USDC")
-
-            all_trades.extend(trades)
-            if trades:
-                pnls    = [t["pnl"] for t in trades]
-                wins    = sum(1 for p in pnls if p > 0)
-                tot_pnl = sum(pnls)
-                print(f"\n  Totale trade: {len(trades)} | Wins: {wins} "
-                      f"({wins/len(trades)*100:.0f}%) | PnL: {tot_pnl:+.2f} USDC")
-
-        # Riepilogo globale
-        print(f"\n{'═'*60}")
-        if all_trades:
-            pnls = [t["pnl"] for t in all_trades]
-            wins = sum(1 for p in pnls if p > 0)
-            print(f"  RIEPILOGO GLOBALE")
-            print(f"  Trade totali  : {len(pnls)}")
-            print(f"  Win rate      : {wins/len(pnls)*100:.1f}%")
-            print(f"  PnL totale    : {sum(pnls):+.2f} USDC")
-            print(f"  Miglior trade : {max(pnls):+.2f} USDC")
-            print(f"  Peggior trade : {min(pnls):+.2f} USDC")
-        print(f"  Capitale finale: {wallet:.2f} USDC "
-              f"(rendimento: {(wallet/initial_capital-1)*100:+.2f}%)")
-        print(f"{'═'*60}\n")
+        best_clean = {k: v for k, v in best.items() if not k.startswith("_")}
+        with open("best_config.json", "w") as f:
+            json.dump(best_clean, f, indent=2)
+        print(f"\n  💾 Best config salvata in: best_config.json")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Crypto Trading Bot v2.0")
-    parser.add_argument("--live", action="store_true", help="Trading live su Binance")
-    parser.add_argument("--backtest", action="store_true", help="Esegui backtest storico")
-    parser.add_argument("--days", type=int, default=500, help="Giorni backtest")
-    parser.add_argument("--capital", type=float, default=100.0, help="Capitale backtest (USDC)")
-    parser.add_argument("--symbols", type=str, default=None, help="Simboli separati da virgola")
-    parser.add_argument("--interval", type=str, default=None, help="Intervallo candele")
-    parser.add_argument("--threshold", type=float, default=None, help="Soglia score segnale")
+DEFAULT_SYMBOLS = [
+    "BTCUSDC", "ETHUSDC", "BNBUSDC", "SOLUSDC",
+    "XRPUSDC", "ADAUSDC", "DOGEUSDC", "AVAXUSDC",
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Ottimizzatore parametri per il bot di trading crypto (multi-window)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Esempi:
+  # Ricerca casuale, 5 finestre da 90-365 gg su 2 anni di storico
+  python optimizer.py --random 500 --days 730 --windows 5
+
+  # Più storico, finestre più piccole, più finestre → validazione più robusta
+  python optimizer.py --random 300 --days 1095 --windows 8 --win-min 60 --win-max 180
+
+  # Solo BTC+ETH, intervallo 4h, 6 finestre
+  python optimizer.py --random 200 --days 730 --interval 4h --symbols BTCUSDC,ETHUSDC --windows 6
+
+  # Grid search con 4 finestre
+  python optimizer.py --grid --days 365 --interval 1d --windows 4 --jobs 2
+        """)
+
+    mode_grp = parser.add_mutually_exclusive_group(required=True)
+    mode_grp.add_argument("--random", type=int, metavar="N",
+                          help="Ricerca casuale: N combinazioni da campionare")
+    mode_grp.add_argument("--grid",   action="store_true",
+                          help="Grid search: tutte le combinazioni (può essere lento!)")
+
+    parser.add_argument("--symbols",   default=",".join(DEFAULT_SYMBOLS),
+                        help="Simboli separati da virgola (default: tutti)")
+    parser.add_argument("--interval",  default="1d",
+                        help="Intervallo candele: 15m,1h,4h,1d (default: 1d)")
+    parser.add_argument("--days",      type=int,   default=730,
+                        help="Giorni di storico da scaricare (default: 730). "
+                             "Più alto = finestre più varie.")
+    parser.add_argument("--capital",   type=float, default=100.0,
+                        help="Capitale iniziale per il backtest (default: 100)")
+    parser.add_argument("--min-trades",type=int,   default=10,
+                        help="Numero minimo di trade totali (tutte le finestre) "
+                             "per considerare la config (default: 10)")
+    parser.add_argument("--jobs",      type=int,
+                        default=max(1, cpu_count() - 1),
+                        help=f"Job paralleli (default: {max(1, cpu_count()-1)}, "
+                             f"Raspberry Pi: usa 1 o 2)")
+    parser.add_argument("--top",       type=int,   default=10,
+                        help="Numero di configurazioni top da mostrare (default: 10)")
+    parser.add_argument("--out",       default="optimizer_results.csv",
+                        help="File CSV di output (default: optimizer_results.csv)")
+    parser.add_argument("--seed",      type=int,   default=42,
+                        help="Seed casuale per riproducibilità (default: 42)")
+    parser.add_argument("--force-download", action="store_true",
+                        help="Forza ri-download dei dati (ignora cache)")
+
+    # ── Nuovi parametri per la validazione multi-finestra ────────────────────
+    parser.add_argument("--windows",   type=int,   default=5,
+                        help="Numero di finestre temporali casuali per la validazione "
+                             "(default: 5). Aumenta per maggiore robustezza.")
+    parser.add_argument("--win-min",   type=int,   default=90,
+                        help="Durata minima di ogni finestra in giorni (default: 90)")
+    parser.add_argument("--win-max",   type=int,   default=None,
+                        help="Durata massima di ogni finestra in giorni "
+                             "(default: days // 2). Non può superare days.")
+
     args = parser.parse_args()
 
-    cfg = Config.load_configs()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
-    if args.symbols:
-        cfg.SYMBOLS = [s.strip().upper() for s in args.symbols.split(",")]
-    if args.interval:
-        cfg.INTERVAL = args.interval
-    if args.threshold is not None:
-        cfg.SIGNAL_THRESHOLD = args.threshold
+    symbols = [s.strip().upper() for s in args.symbols.split(",")]
+    win_max = args.win_max if args.win_max else args.days // 2
+    win_max = min(win_max, args.days - 1)   # sanity
 
-    if args.live:
-        bot = TradingBot(cfg)
-        bot.start()
-    elif args.backtest:
-        bt = Backtester(cfg)
-        bt.run(days=args.days, initial_capital=args.capital)
+    print(f"""
+╔══════════════════════════════════════════════════════════════╗
+║      CRYPTO STRATEGY OPTIMIZER v1.1 — MULTI-WINDOW          ║
+╠══════════════════════════════════════════════════════════════╣
+║  Simboli   : {', '.join(symbols):<43} ║
+║  Intervallo: {args.interval:<47} ║
+║  Storico   : {args.days} giorni{'':<39} ║
+║  Capitale  : {args.capital:.0f} USDC{'':<42} ║
+║  Min trade : {args.min_trades:<47} ║
+║  Jobs      : {args.jobs:<47} ║
+╠══════════════════════════════════════════════════════════════╣
+║  Finestre  : {args.windows} casuali | {args.win_min}–{win_max}gg ciascuna{'':<23} ║
+║  Seed      : {args.seed:<47} ║
+╚══════════════════════════════════════════════════════════════╝""")
+
+    opt = Optimizer(
+        symbols         = symbols,
+        interval        = args.interval,
+        days            = args.days,
+        initial_capital = args.capital,
+        min_trades      = args.min_trades,
+        n_jobs          = args.jobs,
+        top_n           = args.top,
+        output_csv      = args.out,
+    )
+
+    # 1. Scarica dati
+    opt.load_data(force_download=args.force_download)
+    if not opt.data_map:
+        print("  ERRORE: nessun dato scaricato. Controlla la connessione o i simboli.")
+        sys.exit(1)
+
+    # 2. Genera finestre temporali (una sola volta, uguali per tutte le combo)
+    try:
+        windows = generate_windows(
+            data_map  = opt.data_map,
+            n_windows = args.windows,
+            min_days  = args.win_min,
+            max_days  = win_max,
+            interval  = args.interval,
+            seed      = args.seed,
+        )
+    except ValueError as e:
+        print(f"  ERRORE nella generazione delle finestre: {e}")
+        sys.exit(1)
+
+    print_windows(windows, opt.data_map, args.interval)
+
+    # 3. Genera lista di ParamSet
+    base = ParamSet()
+    if args.random:
+        n = args.random
+        print(f"\n  Generazione {n} combinazioni casuali (seed={args.seed})...")
+        param_list = [random_param_set(base) for _ in range(n)]
+        param_list.append(base)   # includi sempre il default come riferimento
     else:
-        parser.print_help()
+        print(f"\n  Generazione grid search (spazio completo)...")
+        param_list = grid_param_sets(base)
+        grid_size  = len(param_list)
+        print(f"  Grid size: {grid_size} combinazioni")
+        if grid_size > 10_000:
+            print(f"  ⚠️  Grid molto grande! Considera --random per la ricerca casuale.")
+            confirm = input("  Procedere? [s/N]: ")
+            if confirm.lower() != "s":
+                sys.exit(0)
 
+    # 4. Ottimizzazione
+    results = opt.run(param_list, windows)
+
+    # 5. Salva e stampa risultati
+    opt.save_results(results)
+    opt.print_leaderboard(results, windows)
+
+
+if __name__ == "__main__":
+    main()
