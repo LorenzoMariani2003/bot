@@ -37,6 +37,7 @@ import random
 import sys
 import time
 import warnings
+import hashlib
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timedelta
 from multiprocessing import Pool, cpu_count
@@ -181,9 +182,6 @@ class TimeWindow:
     """
     Finestra temporale definita come slice (start_offset, end_offset)
     sull'array di candele del DataFrame.
-
-    Identica per tutti i simboli e per tutte le combinazioni di parametri:
-    garantisce un confronto equo tra configurazioni diverse.
     """
     idx:          int   # numero progressivo (0-based)
     start_offset: int   # indice di inizio (incluso)
@@ -200,17 +198,7 @@ def generate_windows(data_map:  Dict[str, pd.DataFrame],
                      max_days:  int,
                      interval:  str,
                      seed:      int) -> List[TimeWindow]:
-    """
-    Genera N finestre temporali casuali, uguali per tutte le combinazioni.
-
-    La dimensione di ciascuna finestra è campionata uniformemente in
-    [min_days, max_days] (convertito in candele secondo l'intervallo).
-    La posizione iniziale è scelta casualmente nello storico disponibile.
-
-    In questo modo ogni configurazione è testata su K periodi di mercato
-    diversi (trend, laterale, crash, rally, ecc.), rendendo il ranking
-    molto più robusto rispetto al solo backtest sull'intero dataset.
-    """
+    """Genera N finestre temporali casuali, uguali per tutte le combinazioni."""
     cpd = CANDLES_PER_DAY.get(interval, 1.0)
 
     valid_dfs = [df for df in data_map.values() if not df.empty]
@@ -255,7 +243,6 @@ def generate_windows(data_map:  Dict[str, pd.DataFrame],
 def print_windows(windows: List[TimeWindow],
                   data_map: Dict[str, pd.DataFrame],
                   interval: str):
-    """Stampa un riepilogo leggibile delle finestre generate."""
     cpd = CANDLES_PER_DAY.get(interval, 1.0)
     ref_df = next(iter(data_map.values()), None)
 
@@ -286,10 +273,6 @@ def _cache_path(symbol: str, interval: str, days: int) -> str:
 
 def fetch_klines(symbol: str, interval: str, days: int,
                  force_download: bool = False) -> pd.DataFrame:
-    """
-    Scarica le candele OHLCV da Binance e le mette in cache (.parquet).
-    Se il file esiste ed è recente (<1h), riusa la cache.
-    """
     cache_file = _cache_path(symbol, interval, days)
     if not force_download and os.path.exists(cache_file):
         age = time.time() - os.path.getmtime(cache_file)
@@ -370,7 +353,6 @@ def _atr(df: pd.DataFrame, period: int) -> pd.Series:
 
 
 def _adx(df: pd.DataFrame, period: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """Ritorna (ADX, +DI, -DI)."""
     high, low = df["high"], df["low"]
     atr       = _atr(df, period)
 
@@ -389,21 +371,6 @@ def _adx(df: pd.DataFrame, period: int) -> Tuple[pd.Series, pd.Series, pd.Series
 
 
 def compute_signals(df: pd.DataFrame, p: ParamSet) -> pd.DataFrame:
-    """
-    Calcolo vettoriale di tutti gli indicatori e dei segnali BUY/SELL.
-
-    PUNTEGGIO BUY (max 100):
-      25 pt — EMA trend:   close > EMA(ema_trend)  [opzionale se ema_trend==0]
-      20 pt — EMA cross:   EMA(fast) > EMA(slow)
-      15 pt — ADX:         ADX > adx_min e +DI > -DI [opzionale se adx_min==0]
-      15 pt — RSI:         RSI < rsi_ob (bonus pieno se RSI < rsi_os)
-      10 pt — Bollinger:   close < BB_middle
-      10 pt — Volume:      volume > vol_mult × SMA(volume, 20)
-       5 pt — Neutro OB:   fisso 0.5 (order book non disponibile in backtest)
-
-    BUY  → score >= signal_threshold
-    SELL → EMA(fast) < EMA(slow)  [conferma con barra precedente]
-    """
     close  = df["close"]
     high   = df["high"]
     low    = df["low"]
@@ -466,7 +433,6 @@ def compute_signals(df: pd.DataFrame, p: ParamSet) -> pd.DataFrame:
 
 @dataclass
 class BacktestResult:
-    """Metriche di un singolo backtest."""
     symbol:        str
     n_trades:      int
     win_rate:      float
@@ -482,15 +448,6 @@ class BacktestResult:
 def simulate(sig: pd.DataFrame, p: ParamSet,
              initial_capital: float = 100.0,
              symbol: str = "?") -> BacktestResult:
-    """
-    Simula le trade con gestione intra-candela di SL e TP.
-
-    Per ogni candela IN posizione:
-      - Se low  <= SL → uscita al prezzo SL (ipotesi peggiore intra-barra)
-      - Se high >= TP → uscita al prezzo TP
-      - Se segnale sell → uscita al close
-    Il check SL ha priorità sul TP (conservativo).
-    """
     capital  = initial_capital
     position = None
     trades   = []
@@ -625,26 +582,8 @@ def simulate(sig: pd.DataFrame, p: ParamSet,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_backtest_trial(args: Tuple) -> Optional[dict]:
-    """
-    Funzione libera (compatibile con multiprocessing.Pool).
-
-    Per ogni ParamSet esegue il backtest su CIASCUNA finestra temporale,
-    poi aggrega le metriche cross-window con due fattori correttivi:
-
-      consistency_factor = 0.5 + 0.5 × (finestre profittevoli / totale)
-        → penalizza strategie che funzionano solo in certi regimi di mercato
-
-      stability_factor   = 1 / (1 + std_composite × 0.05)
-        → penalizza alta variabilità di performance tra finestre diverse
-
-      composite_finale = mean_composite × consistency_factor × stability_factor
-
-    Riceve: (ParamSet, {symbol: DataFrame}, [TimeWindow], initial_capital, min_trades)
-    Ritorna: dict con metriche aggregate, o None se non valido.
-    """
     p, data_map, windows, initial_capital, min_trades = args
 
-    # ── Itera su tutte le finestre temporali ─────────────────────────────────
     per_window: List[dict] = []
 
     for win in windows:
@@ -665,7 +604,6 @@ def run_backtest_trial(args: Tuple) -> Optional[dict]:
             except Exception:
                 continue
 
-        # Nessun simbolo aveva dati sufficienti in questa finestra
         if not win_results:
             per_window.append({"n_trades": 0, "win_rate": 0.0,
                                 "total_return": 0.0, "profit_factor": 0.0,
@@ -682,7 +620,6 @@ def run_backtest_trial(args: Tuple) -> Optional[dict]:
                                 "composite": -999.0, "profitable": False})
             continue
 
-        # Media pesata per numero di trade su tutti i simboli della finestra
         def wavg(attr: str) -> float:
             weights = [max(r.n_trades, 1) for r in win_results]
             vals    = [getattr(r, attr) for r in win_results]
@@ -701,7 +638,6 @@ def run_backtest_trial(args: Tuple) -> Optional[dict]:
             "profitable":    wavg("total_return") > 0,
         })
 
-    # ── Filtra finestre con almeno un trade ───────────────────────────────────
     active       = [w for w in per_window if w["n_trades"] > 0]
     total_trades = sum(w["n_trades"] for w in active)
 
@@ -712,7 +648,6 @@ def run_backtest_trial(args: Tuple) -> Optional[dict]:
     n_profitable = sum(1 for w in per_window if w.get("profitable", False))
     consistency  = n_profitable / n_win if n_win > 0 else 0.0
 
-    # Media pesata cross-window (peso = numero di trade nella finestra)
     def cross_avg(key: str) -> float:
         if not active:
             return 0.0
@@ -722,18 +657,11 @@ def run_backtest_trial(args: Tuple) -> Optional[dict]:
 
     mean_composite = cross_avg("composite")
 
-    # Deviazione standard del composite tra finestre attive
     composites    = [w["composite"] for w in active if w["composite"] > -100]
     composite_std = float(np.std(composites)) if len(composites) > 1 else 0.0
 
-    # ── Punteggio finale robusto ──────────────────────────────────────────────
-    # consistency_factor ∈ [0.5, 1.0]: dimezza il punteggio se nessuna finestra
-    #   è profittevole, lo lascia intatto se tutte lo sono
     consistency_factor = 0.5 + 0.5 * consistency
-
-    # stability_factor ∈ (0, 1]: penalizza alta variabilità tra finestre
     stability_factor = 1.0 / (1.0 + composite_std * 0.05)
-
     final_composite = mean_composite * consistency_factor * stability_factor
 
     row = asdict(p)
@@ -748,7 +676,7 @@ def run_backtest_trial(args: Tuple) -> Optional[dict]:
         "_avg_duration":      cross_avg("avg_duration"),
         "_composite":         final_composite,
         "_mean_composite":    mean_composite,
-        "_consistency":       consistency * 100.0,    # in %
+        "_consistency":       consistency * 100.0,
         "_composite_std":     composite_std,
         "_n_windows":         n_win,
         "_n_windows_active":  len(active),
@@ -851,13 +779,12 @@ class Optimizer:
             w = csv.DictWriter(f, fieldnames=results[0].keys())
             w.writeheader()
             w.writerows(results)
-        print(f"\n  💾 Risultati salvati in: {self.output_csv}")
+        print(f"\n  💾 Risultati CSV salvati in: {self.output_csv}")
 
     def print_leaderboard(self, results: List[dict],
                           windows: List[TimeWindow]):
         if not results:
             print("\n  ⚠️  Nessuna configurazione valida trovata.")
-            print("     Prova a ridurre --min-trades, --windows o allargare lo spazio.")
             return
 
         top = results[:self.top_n]
@@ -867,7 +794,6 @@ class Optimizer:
         print(f"{'  🏆  LEADERBOARD TOP ' + str(self.top_n) + '  (validazione su ' + str(len(windows)) + ' finestre)':^{W}}")
         print(f"{'═'*W}")
 
-        # ── Header ────────────────────────────────────────────────────────────
         cols = [
             ("Rk",    3), ("EMAf", 5), ("EMAs", 5), ("EMAt", 5),
             ("ADXm",  5), ("RSIob",6), ("SLx",  5), ("TPx",  5),
@@ -908,15 +834,6 @@ class Optimizer:
             print(line)
 
         print(f"  {'─'*(W-2)}")
-        print(f"  Colonne: EMAf/s/t=periodi EMA fast/slow/trend | ADXm=ADX min | "
-              f"RSIob=RSI overbought | SLx/TPx=moltiplicatori ATR")
-        print(f"           Thr=soglia score | POS%=% capitale/trade | N#=N.trade totali "
-              f"(tutte le finestre)")
-        print(f"           WR%=winrate | Ret%=rendimento medio | PF=profit factor | "
-              f"DD%=max drawdown medio")
-        print(f"           Cons%=% finestre con rendimento positivo | "
-              f"Std=deviazione composite tra finestre | Score=composite finale")
-        print(f"{'═'*W}")
 
         # ── Dettaglio configurazione #1 ───────────────────────────────────────
         best = top[0]
@@ -925,53 +842,38 @@ class Optimizer:
 
         print(f"\n  ★ CONFIGURAZIONE OTTIMALE (rank #1):")
         print(f"  {'─'*55}")
-        param_keys = [f.name for f in fields(ParamSet())
-                      if f.name != "SEARCH_SPACE"]
-        for k in param_keys:
-            if k in best:
-                print(f"    {k:<25} = {best[k]}")
+        
+        # ─── INCLUSIONE DELL'INTERVAL E CREAZIONE FILE UNIVOCO ──────────────
+        best_clean = {k: v for k, v in best.items() if not k.startswith("_")}
+        
+        # Aggiungo esplicitamente l'interval dentro il JSON
+        best_clean["INTERVAL"] = self.interval
+        
+        # Creiamo un codice univoco hash basato sui parametri esatti (stringa deterministica)
+        param_str = json.dumps(best_clean, sort_keys=True)
+        config_hash = hashlib.md5(param_str.encode('utf-8')).hexdigest()[:6]
+        
+        # Costruisco un nome leggibile per il file json
+        file_name = f"config_{self.interval}_{best_clean['ema_fast']}-{best_clean['ema_slow']}_{config_hash}.json"
+        out_dir = "optimizer_outputs"
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, file_name)
 
-        print(f"\n  Performance aggregata su {n_win_total} finestre "
-              f"[{self.interval}] {self.days}d | capitale {self.initial_capital:.0f} USDC:")
-        print(f"    Trade totali   : {best['_n_trades']}  "
-              f"(finestre attive: {n_win_active}/{n_win_total})")
+        for k, v in best_clean.items():
+            print(f"    {k:<25} = {v}")
+
+        print(f"\n  Performance aggregata su {n_win_total} finestre ")
+        print(f"    Trade totali   : {best['_n_trades']}  (finestre attive: {n_win_active}/{n_win_total})")
         print(f"    Win rate medio : {best['_win_rate']:.1f}%")
         print(f"    Rendimento medio: {best['_total_return']:+.2f}%")
-        print(f"    Profit Factor  : {best['_profit_factor']:.2f}")
-        print(f"    Max Drawdown   : {best['_max_drawdown']:.2f}%")
-        print(f"    Sharpe ratio   : {best['_sharpe']:.2f}")
-        print(f"    ─── Robustezza ───────────────────────────")
-        print(f"    Consistenza    : {best['_consistency']:.1f}%  "
-              f"({int(round(best['_consistency']*n_win_total/100))}/{n_win_total} "
-              f"finestre profittevoli)")
-        print(f"    Stabilità (Std): {best['_composite_std']:.3f}  "
-              f"(più basso = più stabile)")
-        print(f"    Score composito: {best['_mean_composite']:+.2f} (grezzo) "
-              f"→ {best['_composite']:+.2f} (aggiustato)")
+        print(f"    Score composito: {best['_composite']:+.2f}")
         print(f"  {'─'*55}")
 
-        # ── Snippet Python per il bot ─────────────────────────────────────────
-        print(f"\n  📋 SNIPPET — copia in Config() del tuo bot:")
-        print(f"  {'─'*55}")
-        print(f"  cfg = Config(")
-        snippet_keys = [
-            "ema_fast", "ema_slow", "ema_trend",
-            "adx_period", "adx_min",
-            "rsi_period", "rsi_ob", "rsi_os",
-            "atr_period", "atr_stop_mult", "atr_tp_mult",
-            "bb_period", "bb_std",
-            "vol_mult", "signal_threshold", "position_pct",
-        ]
-        for k in snippet_keys:
-            if k in best:
-                print(f"      {k.upper():<25} = {best[k]},")
-        print(f"  )")
-        print(f"  {'─'*55}")
-
-        best_clean = {k: v for k, v in best.items() if not k.startswith("_")}
-        with open("best_config.json", "w") as f:
+        with open(out_path, "w") as f:
             json.dump(best_clean, f, indent=2)
-        print(f"\n  💾 Best config salvata in: best_config.json")
+            
+        print(f"\n  ✅ Configurazione univoca salvata in: {out_path}")
+        print(f"     Per usarla, copia questo file nella cartella principale e rinominalo in 'best_config.json'")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -986,45 +888,28 @@ DEFAULT_SYMBOLS = [
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Ottimizzatore parametri per il bot di trading crypto (multi-window)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Esempi:
-  # Ricerca casuale, 5 finestre da 90-365 gg su 2 anni di storico
-  python optimizer.py --random 500 --days 730 --windows 5
-
-  # Più storico, finestre più piccole, più finestre → validazione più robusta
-  python optimizer.py --random 300 --days 1095 --windows 8 --win-min 60 --win-max 180
-
-  # Solo BTC+ETH, intervallo 4h, 6 finestre
-  python optimizer.py --random 200 --days 730 --interval 4h --symbols BTCUSDC,ETHUSDC --windows 6
-
-  # Grid search con 4 finestre
-  python optimizer.py --grid --days 365 --interval 1d --windows 4 --jobs 2
-        """)
+        description="Ottimizzatore parametri multi-window (ora con salvataggi univoci)"
+    )
 
     mode_grp = parser.add_mutually_exclusive_group(required=True)
     mode_grp.add_argument("--random", type=int, metavar="N",
                           help="Ricerca casuale: N combinazioni da campionare")
     mode_grp.add_argument("--grid",   action="store_true",
-                          help="Grid search: tutte le combinazioni (può essere lento!)")
+                          help="Grid search: tutte le combinazioni")
 
     parser.add_argument("--symbols",   default=",".join(DEFAULT_SYMBOLS),
                         help="Simboli separati da virgola (default: tutti)")
     parser.add_argument("--interval",  default="1d",
                         help="Intervallo candele: 15m,1h,4h,1d (default: 1d)")
     parser.add_argument("--days",      type=int,   default=730,
-                        help="Giorni di storico da scaricare (default: 730). "
-                             "Più alto = finestre più varie.")
+                        help="Giorni di storico da scaricare (default: 730)")
     parser.add_argument("--capital",   type=float, default=100.0,
                         help="Capitale iniziale per il backtest (default: 100)")
     parser.add_argument("--min-trades",type=int,   default=10,
-                        help="Numero minimo di trade totali (tutte le finestre) "
-                             "per considerare la config (default: 10)")
+                        help="Numero minimo di trade totali")
     parser.add_argument("--jobs",      type=int,
                         default=max(1, cpu_count() - 1),
-                        help=f"Job paralleli (default: {max(1, cpu_count()-1)}, "
-                             f"Raspberry Pi: usa 1 o 2)")
+                        help="Job paralleli")
     parser.add_argument("--top",       type=int,   default=10,
                         help="Numero di configurazioni top da mostrare (default: 10)")
     parser.add_argument("--out",       default="optimizer_results.csv",
@@ -1033,16 +918,12 @@ Esempi:
                         help="Seed casuale per riproducibilità (default: 42)")
     parser.add_argument("--force-download", action="store_true",
                         help="Forza ri-download dei dati (ignora cache)")
-
-    # ── Nuovi parametri per la validazione multi-finestra ────────────────────
     parser.add_argument("--windows",   type=int,   default=5,
-                        help="Numero di finestre temporali casuali per la validazione "
-                             "(default: 5). Aumenta per maggiore robustezza.")
+                        help="Numero di finestre temporali casuali")
     parser.add_argument("--win-min",   type=int,   default=90,
                         help="Durata minima di ogni finestra in giorni (default: 90)")
     parser.add_argument("--win-max",   type=int,   default=None,
-                        help="Durata massima di ogni finestra in giorni "
-                             "(default: days // 2). Non può superare days.")
+                        help="Durata massima di ogni finestra in giorni ")
 
     args = parser.parse_args()
 
@@ -1051,22 +932,7 @@ Esempi:
 
     symbols = [s.strip().upper() for s in args.symbols.split(",")]
     win_max = args.win_max if args.win_max else args.days // 2
-    win_max = min(win_max, args.days - 1)   # sanity
-
-    print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║      CRYPTO STRATEGY OPTIMIZER v1.1 — MULTI-WINDOW          ║
-╠══════════════════════════════════════════════════════════════╣
-║  Simboli   : {', '.join(symbols):<43} ║
-║  Intervallo: {args.interval:<47} ║
-║  Storico   : {args.days} giorni{'':<39} ║
-║  Capitale  : {args.capital:.0f} USDC{'':<42} ║
-║  Min trade : {args.min_trades:<47} ║
-║  Jobs      : {args.jobs:<47} ║
-╠══════════════════════════════════════════════════════════════╣
-║  Finestre  : {args.windows} casuali | {args.win_min}–{win_max}gg ciascuna{'':<23} ║
-║  Seed      : {args.seed:<47} ║
-╚══════════════════════════════════════════════════════════════╝""")
+    win_max = min(win_max, args.days - 1)
 
     opt = Optimizer(
         symbols         = symbols,
@@ -1079,50 +945,30 @@ Esempi:
         output_csv      = args.out,
     )
 
-    # 1. Scarica dati
     opt.load_data(force_download=args.force_download)
     if not opt.data_map:
-        print("  ERRORE: nessun dato scaricato. Controlla la connessione o i simboli.")
         sys.exit(1)
 
-    # 2. Genera finestre temporali (una sola volta, uguali per tutte le combo)
-    try:
-        windows = generate_windows(
-            data_map  = opt.data_map,
-            n_windows = args.windows,
-            min_days  = args.win_min,
-            max_days  = win_max,
-            interval  = args.interval,
-            seed      = args.seed,
-        )
-    except ValueError as e:
-        print(f"  ERRORE nella generazione delle finestre: {e}")
-        sys.exit(1)
+    windows = generate_windows(
+        data_map  = opt.data_map,
+        n_windows = args.windows,
+        min_days  = args.win_min,
+        max_days  = win_max,
+        interval  = args.interval,
+        seed      = args.seed,
+    )
 
     print_windows(windows, opt.data_map, args.interval)
 
-    # 3. Genera lista di ParamSet
     base = ParamSet()
     if args.random:
-        n = args.random
-        print(f"\n  Generazione {n} combinazioni casuali (seed={args.seed})...")
-        param_list = [random_param_set(base) for _ in range(n)]
-        param_list.append(base)   # includi sempre il default come riferimento
+        param_list = [random_param_set(base) for _ in range(args.random)]
+        param_list.append(base)
     else:
-        print(f"\n  Generazione grid search (spazio completo)...")
         param_list = grid_param_sets(base)
-        grid_size  = len(param_list)
-        print(f"  Grid size: {grid_size} combinazioni")
-        if grid_size > 10_000:
-            print(f"  ⚠️  Grid molto grande! Considera --random per la ricerca casuale.")
-            confirm = input("  Procedere? [s/N]: ")
-            if confirm.lower() != "s":
-                sys.exit(0)
 
-    # 4. Ottimizzazione
     results = opt.run(param_list, windows)
 
-    # 5. Salva e stampa risultati
     opt.save_results(results)
     opt.print_leaderboard(results, windows)
 
