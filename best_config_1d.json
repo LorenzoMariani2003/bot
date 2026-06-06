@@ -1,0 +1,19 @@
+{
+  "ema_fast": 8,
+  "ema_slow": 26,
+  "ema_trend": 75,
+  "adx_period": 10,
+  "adx_min": 0,
+  "rsi_period": 10,
+  "rsi_ob": 55,
+  "rsi_os": 30,
+  "atr_period": 7,
+  "atr_stop_mult": 3.0,
+  "atr_tp_mult": 6.0,
+  "bb_period": 30,
+  "bb_std": 2.2,
+  "vol_mult": 1.2,
+  "signal_threshold": 45,
+  "position_pct": 0.3,
+  "commission": 0.001
+}
